@@ -39,8 +39,6 @@ type Hub struct {
 	kick     chan struct{}
 
 	version atomic.Int64
-	seqMu   sync.Mutex
-	lastSeq map[string]int64
 
 	diagMu   sync.Mutex
 	diagWait map[string]chan proto.DiagResult
@@ -68,7 +66,7 @@ type nodeConn struct {
 func newHub(s *Server) *Hub {
 	return &Hub{
 		s: s, conns: make(map[string]*nodeConn), dirty: make(map[int64]bool),
-		kick: make(chan struct{}, 1), lastSeq: make(map[string]int64),
+		kick:     make(chan struct{}, 1),
 		diagWait: make(map[string]chan proto.DiagResult),
 	}
 }
@@ -261,14 +259,11 @@ func (h *Hub) tunnelSpec(g *Group, withFallback bool, groups map[int64]*Group) *
 
 func (h *Hub) buildConfig(groupID int64) (*proto.NodeConfig, error) {
 	db := h.s.db
-	all, err := listGroups(db)
+	policy, err := loadRulePolicy(db)
 	if err != nil {
 		return nil, err
 	}
-	groups := make(map[int64]*Group, len(all))
-	for _, g := range all {
-		groups[g.ID] = g
-	}
+	groups := policy.groups
 	g := groups[groupID]
 	if g == nil {
 		return nil, fmt.Errorf("设备组不存在")
@@ -282,7 +277,7 @@ func (h *Hub) buildConfig(groupID int64) (*proto.NodeConfig, error) {
 			BlockedProtocols: gc.BlockedProtocols, BlockedHosts: gc.BlockedHosts, AllowedHosts: gc.AllowedHosts,
 			AllowPrivate: gc.AllowPrivate, DisableUDP: gc.DisableUDP, MaxFail: gc.MaxFail, FailTimeout: gc.FailTimeout,
 		}
-		rows, err := db.Query(`SELECT `+ruleCols+`,u.speed_limit,u.conn_limit,u.ip_limit FROM rules r
+		rows, err := db.Query(`SELECT `+ruleCols+`,u.speed_limit,u.conn_limit,u.ip_limit,u.role,u.plan_id FROM rules r
 			JOIN users u ON u.id=r.user_id WHERE r.in_group=? AND r.paused=0 AND `+activeUserSQL+` ORDER BY r.id`, groupID, now())
 		if err != nil {
 			return nil, err
@@ -290,9 +285,13 @@ func (h *Hub) buildConfig(groupID int64) (*proto.NodeConfig, error) {
 		defer rows.Close()
 		for rows.Next() {
 			var us, uc, ui int
-			r, err := scanRule(rows, &us, &uc, &ui)
+			var owner User
+			r, err := scanRule(rows, &us, &uc, &ui, &owner.Role, &owner.PlanID)
 			if err != nil {
 				return nil, err
+			}
+			if policy.authorize(&owner, r) != nil {
+				continue
 			}
 			pr := proto.Rule{
 				ID: r.ID, UserID: r.UserID, ListenPort: r.ListenPort, Proto: r.Proto, OutGroup: r.OutGroup,
@@ -321,7 +320,7 @@ func (h *Hub) buildConfig(groupID int64) (*proto.NodeConfig, error) {
 	// 出口:本组的规则 + 以本组为故障转移组的出口组的规则
 	ids := []any{groupID}
 	ph := "?"
-	for _, og := range all {
+	for _, og := range groups {
 		if og.Type == proto.RoleOut && og.ID != groupID && og.Config.FailoverGroup == groupID {
 			ids = append(ids, og.ID)
 			ph += ",?"
@@ -337,16 +336,20 @@ func (h *Hub) buildConfig(groupID int64) (*proto.NodeConfig, error) {
 	case gc.Transport == tunnel.TransportTLS || gc.Transport == tunnel.TransportWSS:
 		out.CertPEM, out.KeyPEM = gc.CertPEM, gc.KeyPEM
 	}
-	rows, err := db.Query(`SELECT `+ruleCols+` FROM rules r JOIN users u ON u.id=r.user_id
+	rows, err := db.Query(`SELECT `+ruleCols+`,u.role,u.plan_id FROM rules r JOIN users u ON u.id=r.user_id
 		WHERE r.out_group IN (`+ph+`) AND r.paused=0 AND `+activeUserSQL+` ORDER BY r.id`, append(ids, now())...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	for rows.Next() {
-		r, err := scanRule(rows)
+		var owner User
+		r, err := scanRule(rows, &owner.Role, &owner.PlanID)
 		if err != nil {
 			return nil, err
+		}
+		if policy.authorize(&owner, r) != nil {
+			continue
 		}
 		out.Rules = append(out.Rules, proto.OutRule{ID: r.ID, Targets: r.Targets, LB: r.LB, ProxyProtocol: r.ProxyProtocol})
 	}
@@ -450,13 +453,11 @@ func (h *Hub) serveWS(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	if cfg, err := h.buildConfig(g.ID); err == nil {
-		h.pushConfig(c, cfg, true)
-	} else {
-		log.Printf("[hub] 生成配置失败: %v", err)
-	}
+	// Initial and subsequent configurations go through the same ordered builder.
 	if g.Type == proto.RoleOut {
-		h.Dirty() // 出口节点上线:入口的连接地址列表可能变化
+		h.Dirty()
+	} else {
+		h.Dirty(g.ID)
 	}
 
 	lastTouch := t
@@ -481,26 +482,16 @@ func (h *Hub) serveWS(w http.ResponseWriter, r *http.Request) {
 				lastTouch = n
 				h.s.db.Exec(`UPDATE nodes SET last_seen=? WHERE id=?`, n, c.nodeID)
 			}
-		case proto.TReport:
+		case proto.TReport, proto.TReportV2:
 			var rep proto.Report
-			if json.Unmarshal(m.D, &rep) != nil {
+			if g.Type != proto.RoleIn || json.Unmarshal(m.D, &rep) != nil || (m.T == proto.TReportV2) != (rep.Stream != "") {
 				continue
 			}
-			if g.Type == proto.RoleIn {
-				h.seqMu.Lock()
-				dup := h.lastSeq[c.key] == rep.Seq
-				h.seqMu.Unlock()
-				if !dup {
-					if err := h.ingest(g.ID, &rep); err != nil {
-						log.Printf("[hub] 流量入库失败: %v", err)
-						continue // 不确认,节点稍后会重发
-					}
-					h.seqMu.Lock()
-					h.lastSeq[c.key] = rep.Seq
-					h.seqMu.Unlock()
-				}
+			if err := h.ingest(g.ID, c.hello.UID, &rep); err != nil {
+				log.Printf("[hub] 入口 #%d 流量未确认: %v", g.ID, err)
+				continue
 			}
-			c.trySend(proto.Pack(proto.TAck, proto.Ack{Seq: rep.Seq}))
+			c.trySend(proto.Pack(proto.TAck, proto.Ack{Seq: rep.Seq, Stream: rep.Stream}))
 		case proto.TStatus:
 			var st proto.Status
 			if json.Unmarshal(m.D, &st) != nil {
@@ -532,76 +523,6 @@ func (h *Hub) serveWS(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-}
-
-// ingest 把一次流量上报入库:规则流量、用户已用流量(按倍率)、设备组流量、小时统计。
-// 计费口径:用户扣除 = 实际流量 ×(入口倍率 + 出口倍率),直出只计入口倍率。
-func (h *Hub) ingest(inGroupID int64, rep *proto.Report) error {
-	if len(rep.Items) == 0 {
-		return nil
-	}
-	db := h.s.db
-	ratios := map[int64]float64{}
-	rows, err := db.Query(`SELECT id, ratio FROM device_groups`)
-	if err != nil {
-		return err
-	}
-	for rows.Next() {
-		var id int64
-		var r float64
-		rows.Scan(&id, &r)
-		ratios[id] = r
-	}
-	rows.Close()
-
-	tx, err := db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	hour := now() / 3600 * 3600
-	crossed := false
-	for _, it := range rep.Items {
-		if it.Up < 0 || it.Down < 0 || it.Up+it.Down == 0 {
-			continue
-		}
-		var uid, outGroup int64
-		err := tx.QueryRow(`UPDATE rules SET traffic_up=traffic_up+?, traffic_down=traffic_down+? WHERE id=? AND in_group=?
-			RETURNING user_id, out_group`, it.Up, it.Down, it.RuleID, inGroupID).Scan(&uid, &outGroup)
-		if err != nil {
-			continue // 规则已删除
-		}
-		raw := it.Up + it.Down
-		ratio := ratios[inGroupID]
-		if outGroup != 0 {
-			ratio += ratios[outGroup]
-		}
-		billed := int64(float64(raw) * ratio)
-		var used, quota int64
-		var role string
-		if err := tx.QueryRow(`UPDATE users SET traffic_used=traffic_used+? WHERE id=? RETURNING traffic_used, traffic_quota, role`,
-			billed, uid).Scan(&used, &quota, &role); err == nil {
-			if role != "admin" && used >= quota && used-billed < quota {
-				crossed = true
-			}
-		}
-		if _, err := tx.Exec(`INSERT INTO traffic_hourly(user_id,hour,up,down,billed) VALUES(?,?,?,?,?)
-			ON CONFLICT(user_id,hour) DO UPDATE SET up=up+excluded.up, down=down+excluded.down, billed=billed+excluded.billed`,
-			uid, hour, it.Up, it.Down, billed); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(`UPDATE device_groups SET traffic=traffic+? WHERE id=? OR (id=? AND ?<>0)`,
-			raw, inGroupID, outGroup, outGroup); err != nil {
-			return err
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	if crossed {
-		h.Dirty() // 有用户流量用尽:停掉其规则
-	}
-	return nil
 }
 
 // ---- 查询 ----

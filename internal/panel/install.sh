@@ -29,16 +29,54 @@ done
 
 [ "$(id -u)" = "0" ] || { echo "请使用 root 运行"; exit 1; }
 command -v systemctl >/dev/null || { echo "需要 systemd"; exit 1; }
-case "$NAME" in *[!a-zA-Z0-9_-]*) echo "名称只能包含字母、数字、- 和 _"; exit 1 ;; esac
+die() { printf '%s\n' "$*" >&2; exit 1; }
+case "$NAME" in ''|-*|*[!a-zA-Z0-9_-]*) die '实例名不能为空、不能以 - 开头，只允许字母、数字、- 和 _' ;; esac
 
 DIR="/opt/$NAME"
 UNIT="/etc/systemd/system/$NAME.service"
+MARK="$DIR/.kaze-install-v1"
+# 固定文件清单，不从标记或目录内容读取待删除的路径。
+FILES=("$DIR/kaze-node" "$DIR/env" "$DIR/kaze-node.json" "$DIR/kaze-node.json.tmp")
+exists() { [[ -e $1 || -L $1 ]]; }
+trusted() {
+  local mode
+  [[ ! -L $1 && $(stat -c %u -- "$1") == 0 ]] || return 1
+  mode=$(stat -c %a -- "$1") || return 1
+  (( (8#$mode & 022) == 0 ))
+}
+for parent in /opt /etc /etc/systemd /etc/systemd/system; do
+  [[ -d $parent ]] && trusted "$parent" || die "父目录不安全或不存在: $parent"
+done
+# 协调同时运行的安装/卸载；锁定稳定的父目录，不需创建锁文件。
+exec 9</opt
+flock -x 9 || die '无法取得安装锁'
+unit_record() { local digest; digest=$(sha256sum < "$UNIT") || return 1; printf 'kaze-node-v1 %s %s\n' "$NAME" "${digest%% *}"; }
+managed=0
+if exists "$DIR" || exists "$UNIT"; then
+  [[ -d $DIR ]] && trusted "$DIR" || die "安装目录不安全: $DIR"
+  for f in "$MARK" "$UNIT"; do
+    [[ -f $f ]] && trusted "$f" && [[ $(stat -c %h -- "$f") == 1 ]] || die '未能确认安装归属。旧安装请先备份并手工核对，未做更改。'
+  done
+  unit_record | cmp -s - "$MARK" || die '安装标记与当前实例或服务文件不匹配，未做更改'
+  [[ $(systemctl show --property=FragmentPath --value "$NAME.service") == "$UNIT" ]] || die '生效的服务文件不属于该实例'
+  for f in "${FILES[@]}"; do
+    if exists "$f"; then
+      [[ -f $f ]] && trusted "$f" && [[ $(stat -c %h -- "$f") == 1 ]] || die "实例文件归属异常: $f"
+    fi
+  done
+  managed=1
+else
+  rc=0; load=$(systemctl show --property=LoadState --value "$NAME.service") || rc=$?
+  [[ $load == not-found && ($rc == 0 || $rc == 4) ]] || die '已有同名服务或无法确认该名称可用'
+fi
 
 if [ "$UNINSTALL" = "1" ]; then
-  systemctl disable --now "$NAME" 2>/dev/null || true
-  rm -f "$UNIT"
-  rm -rf "$DIR"
+  if (( ! managed )); then echo "未安装 $NAME，无需卸载"; exit 0; fi
+  systemctl disable --now "$NAME.service" || die '停用服务失败，未删除文件'
+  rm -f -- "$UNIT" "${FILES[@]}" "$MARK"
+  rmdir --ignore-fail-on-non-empty -- "$DIR"
   systemctl daemon-reload
+  [[ ! -d $DIR ]] || printf '已保留未列入清单的文件: %s\n' "$DIR"
   echo "已卸载 $NAME"
   exit 0
 fi
@@ -51,16 +89,24 @@ case "$(uname -m)" in
   *) echo "不支持的架构: $(uname -m)"; exit 1 ;;
 esac
 
-mkdir -p "$DIR"
-chmod 700 "$DIR"
+umask 077
+download=''
+cleanup_download() {
+  [[ -z $download ]] || rm -f -- "$download"
+  # 新安装下载失败时，仅回收本次新建且仍为空的目录，允许直接重试。
+  if (( ! managed )); then rmdir --ignore-fail-on-non-empty -- "$DIR"; fi
+}
+if (( ! managed )); then mkdir -m 700 -- "$DIR"; fi
+trap cleanup_download EXIT
+download=$(mktemp -- "$DIR/.download.XXXXXXXX")
 echo "下载节点端 ($ARCH) ..."
-curl -fL --retry 3 "$PANEL/dl/kaze-node-linux-$ARCH" -o "$DIR/kaze-node.new"
-chmod +x "$DIR/kaze-node.new"
-"$DIR/kaze-node.new" -v >/dev/null || { echo "下载的文件无法运行"; exit 1; }
-mv -f "$DIR/kaze-node.new" "$DIR/kaze-node"
+curl -fL --retry 3 "$PANEL/dl/kaze-node-linux-$ARCH" -o "$download"
+chmod 700 "$download"
+"$download" -v >/dev/null || { echo "下载的文件无法运行"; exit 1; }
+mv -fT -- "$download" "$DIR/kaze-node"
+trap - EXIT
 
 # 令牌放在只有 root 可读的环境文件里,不出现在进程命令行中
-umask 077
 cat > "$DIR/env" <<EOT
 KAZE_PANEL=$PANEL
 KAZE_TOKEN=$TOKEN
@@ -86,6 +132,7 @@ TasksMax=infinity
 WantedBy=multi-user.target
 EOT
 chmod 644 "$UNIT"
+unit_record > "$MARK"
 
 if [ "${OPTIMIZE:-0}" = "1" ]; then
   cat > /etc/sysctl.d/99-kaze.conf <<EOT

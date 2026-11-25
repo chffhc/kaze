@@ -47,6 +47,16 @@ CREATE TABLE IF NOT EXISTS device_groups (
   traffic    INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL
 );
+-- One durable cursor per ingress node / reporting stream, independent of node retention.
+CREATE TABLE IF NOT EXISTS traffic_unattributed (
+ group_id INTEGER NOT NULL, uid TEXT NOT NULL, stream TEXT NOT NULL,
+ seq INTEGER NOT NULL, rule_id INTEGER NOT NULL, up INTEGER NOT NULL, down INTEGER NOT NULL, hour INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS traffic_cursors (
+ group_id INTEGER NOT NULL, uid TEXT NOT NULL, stream TEXT NOT NULL,
+ seq INTEGER NOT NULL, digest BLOB NOT NULL,
+ PRIMARY KEY(group_id,uid,stream)
+) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS nodes (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
   group_id     INTEGER NOT NULL,
@@ -146,7 +156,7 @@ func openDB(dir string) (*sql.DB, error) {
 		return nil, err
 	}
 	dsn := "file:" + filepath.ToSlash(filepath.Join(dir, "kaze.db")) +
-		"?_pragma=busy_timeout(8000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_txlock=immediate"
+		"?_pragma=busy_timeout(8000)&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)&_txlock=immediate"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err

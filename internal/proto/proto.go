@@ -15,7 +15,8 @@ const Version = "1.0.0"
 const (
 	THello      = "hello"
 	TConfig     = "config"
-	TReport     = "report"
+	TReport     = "report" // legacy
+	TReportV2   = "report_v2"
 	TAck        = "ack"
 	TMetrics    = "metrics"
 	TStatus     = "status"
@@ -150,13 +151,15 @@ type Traffic struct {
 
 // Report 是流量上报;面板以 ack{seq} 确认,未确认的会重发。
 type Report struct {
-	Seq   int64     `json:"seq"`
-	Items []Traffic `json:"items"`
+	Stream string    `json:"stream,omitempty"`
+	Seq    int64     `json:"seq"`
+	Items  []Traffic `json:"items"`
 }
 
 // Ack 确认一次流量上报。
 type Ack struct {
-	Seq int64 `json:"seq"`
+	Stream string `json:"stream,omitempty"`
+	Seq    int64  `json:"seq"`
 }
 
 // Metrics 是探针数据。

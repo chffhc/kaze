@@ -605,6 +605,7 @@ func (s *Server) handleAdminPlanSave(w http.ResponseWriter, r *http.Request, u *
 		s.dbErr(w, err)
 		return
 	}
+	s.hub.Dirty()
 	s.ok(w, H{"ok": true})
 }
 
@@ -613,6 +614,7 @@ func (s *Server) handleAdminPlanDelete(w http.ResponseWriter, r *http.Request, u
 		s.dbErr(w, err)
 		return
 	}
+	s.hub.Dirty()
 	s.ok(w, H{"ok": true})
 }
 

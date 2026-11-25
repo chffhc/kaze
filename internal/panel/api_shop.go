@@ -30,6 +30,22 @@ func (s *Server) handlePlans(w http.ResponseWriter, r *http.Request, u *User) {
 	s.ok(w, plans)
 }
 
+// 单行账务写入即使没有 SQL 错误，也必须确实修改一行才能提交。
+func shopWriteOne(q dbq, stmt string, args ...any) error {
+	res, err := q.Exec(stmt, args...)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return fmt.Errorf("账务写入影响 %d 行，预期 1 行", n)
+	}
+	return nil
+}
+
 // applyPlan 把套餐应用到用户:
 // 续费同一套餐且未到期 -> 到期时间顺延;其余情况从现在起算。两种情况都会重置已用流量。
 func applyPlan(tx dbq, u *User, p *Plan) error {
@@ -42,10 +58,9 @@ func applyPlan(tx dbq, u *User, p *Plan) error {
 		}
 		expire = base + int64(p.Days)*86400
 	}
-	_, err := tx.Exec(`UPDATE users SET plan_id=?, traffic_quota=?, traffic_used=0, expire_at=?, max_rules=?,
+	return shopWriteOne(tx, `UPDATE users SET plan_id=?, traffic_quota=?, traffic_used=0, expire_at=?, max_rules=?,
 		speed_limit=?, conn_limit=?, ip_limit=? WHERE id=?`,
 		p.ID, p.Traffic, expire, p.MaxRules, p.SpeedLimit, p.ConnLimit, p.IPLimit, u.ID)
-	return err
 }
 
 // purchase 用余额购买套餐(购买与自动续费共用)。
@@ -174,15 +189,26 @@ func (s *Server) handleRedeem(w http.ResponseWriter, r *http.Request, u *User) {
 		}
 		note = "兑换套餐: " + p.Name
 	} else {
-		if _, err := tx.Exec(`UPDATE users SET balance=balance+? WHERE id=?`, amount, u.ID); err != nil {
+		if err := shopWriteOne(tx, `UPDATE users SET balance=balance+? WHERE id=?`, amount, u.ID); err != nil {
 			s.dbErr(w, err)
 			return
 		}
 		note = "兑换余额"
 	}
-	tx.Exec(`UPDATE redeem_codes SET used_by=?, used_at=? WHERE id=?`, u.ID, t, id)
-	tx.Exec(`INSERT INTO orders(order_no,user_id,type,plan_id,amount,status,pay_method,note,created_at,paid_at)
-		VALUES(?,?,'redeem',?,?,'paid','code',?,?,?)`, orderNo(), u.ID, planID, amount, note, t, t)
+	if err := shopWriteOne(tx, `UPDATE redeem_codes SET used_by=?, used_at=? WHERE id=? AND used_by=0`, u.ID, t, id); err != nil {
+		s.dbErr(w, err)
+		return
+	}
+	if err := shopWriteOne(tx, `INSERT INTO orders(order_no,user_id,type,plan_id,amount,status,pay_method,note,created_at,paid_at)
+		VALUES(?,?,'redeem',?,?,'paid','code',?,?,?)`, orderNo(), u.ID, planID, amount, note, t, t); err != nil {
+		s.dbErr(w, err)
+		return
+	}
+	nu, err := getUser(tx, u.ID)
+	if err != nil {
+		s.dbErr(w, err)
+		return
+	}
 	if err := tx.Commit(); err != nil {
 		s.dbErr(w, err)
 		return
@@ -190,7 +216,6 @@ func (s *Server) handleRedeem(w http.ResponseWriter, r *http.Request, u *User) {
 	if typ == "plan" {
 		s.hub.Dirty()
 	}
-	nu, _ := getUser(s.db, u.ID)
 	s.ok(w, H{"message": note + "成功", "user": nu})
 }
 
@@ -302,8 +327,14 @@ func (s *Server) handleEpayNotify(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "fail", http.StatusBadRequest)
 		return
 	}
-	tx.Exec(`UPDATE orders SET status='paid', paid_at=?, trade_no=? WHERE id=?`, now(), p["trade_no"], id)
-	tx.Exec(`UPDATE users SET balance=balance+? WHERE id=?`, amount, uid)
+	if err := shopWriteOne(tx, `UPDATE orders SET status='paid', paid_at=?, trade_no=? WHERE id=? AND status=?`, now(), p["trade_no"], id, status); err != nil {
+		http.Error(w, "fail", http.StatusInternalServerError)
+		return
+	}
+	if err := shopWriteOne(tx, `UPDATE users SET balance=balance+? WHERE id=?`, amount, uid); err != nil {
+		http.Error(w, "fail", http.StatusInternalServerError)
+		return
+	}
 	if err := tx.Commit(); err != nil {
 		http.Error(w, "fail", http.StatusInternalServerError)
 		return

@@ -35,6 +35,7 @@ type outbound struct {
 type outRule struct {
 	spec proto.OutRule
 	bal  *relay.Balancer
+	live *ruleConns
 }
 
 func newOutbound(a *Agent) *outbound {
@@ -57,10 +58,23 @@ func (o *outbound) apply(cfg *proto.OutboundConfig) error {
 			next[r.ID] = prev
 			continue
 		}
-		next[r.ID] = &outRule{spec: r, bal: relay.NewBalancer(r.Targets, r.LB, cfg.MaxFail,
+		// Existing sessions keep their original targets on edits. Only a
+		// removal ends this ID's lifetime (including sessions predating edits).
+		var live *ruleConns
+		if prev := old[r.ID]; prev != nil {
+			live = prev.live
+		} else {
+			live = newRuleConns()
+		}
+		next[r.ID] = &outRule{spec: r, live: live, bal: relay.NewBalancer(r.Targets, r.LB, cfg.MaxFail,
 			time.Duration(cfg.FailTimeout)*time.Second)}
 	}
 	o.rules.Store(&next)
+	for id, prev := range old {
+		if next[id] == nil {
+			prev.live.stop()
+		}
+	}
 	if d := o.dialer.Load(); d.AllowPrivate != cfg.AllowPrivate {
 		o.dialer.Store(relay.NewDialer(cfg.AllowPrivate))
 	}
@@ -145,6 +159,9 @@ func (o *outbound) closeLocked() {
 func (o *outbound) stopAll() {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	for _, rule := range *o.rules.Swap(&map[int64]*outRule{}) {
+		rule.live.stop()
+	}
 	o.closeLocked()
 }
 
@@ -161,7 +178,11 @@ func (o *outbound) handle(conn net.Conn, h tunnel.StreamHeader) {
 		relay.Abort(conn)
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
+	if !rule.live.track(conn) {
+		return
+	}
+	defer rule.live.forget(conn)
+	ctx, cancel := context.WithTimeout(rule.live.ctx, connectTimeout)
 	defer cancel()
 	d := o.dialer.Load()
 	hash := relay.HashAddr(h.Src.Addr())
@@ -173,12 +194,17 @@ func (o *outbound) handle(conn net.Conn, h tunnel.StreamHeader) {
 			return
 		}
 		cancel()
+		defer be.Active.Add(-1)
+		if !rule.live.track(target) {
+			return
+		}
+		defer rule.live.forget(target)
 		var prefix []byte
 		if rule.spec.ProxyProtocol > 0 {
 			prefix = relay.ProxyHeader(rule.spec.ProxyProtocol, h.Src, addrPortOf(target.LocalAddr()))
 		}
 		relay.Pipe(conn, target, &relay.PipeOpts{Up: &o.sink, Down: &o.sink, Prefix: prefix})
-		be.Active.Add(-1)
+
 	case tunnel.CmdUDP:
 		cands := rule.bal.Candidates(hash)
 		if len(cands) == 0 {
@@ -191,6 +217,10 @@ func (o *outbound) handle(conn net.Conn, h tunnel.StreamHeader) {
 			return
 		}
 		cancel()
+		if !rule.live.track(uc) {
+			return
+		}
+		defer rule.live.forget(uc)
 		relay.ServeUDPStream(conn, uc, 0)
 	}
 }
@@ -205,13 +235,26 @@ func (o *outbound) openUDP(client netip.AddrPort, ruleID uint32) (relay.Upstream
 	if len(cands) == 0 {
 		return nil, fmt.Errorf("没有转发目标")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
+	ctx, cancel := context.WithTimeout(rule.live.ctx, connectTimeout)
 	defer cancel()
 	uc, err := o.dialer.Load().DialUDP(ctx, cands[0].Addr)
 	if err != nil {
 		return nil, err
 	}
-	return relay.UDPConnUpstream{UDPConn: uc}, nil
+	if !rule.live.track(uc) {
+		return nil, net.ErrClosed
+	}
+	return &outUDP{UDPConnUpstream: relay.UDPConnUpstream{UDPConn: uc}, live: rule.live}, nil
+}
+
+type outUDP struct {
+	relay.UDPConnUpstream
+	live *ruleConns
+}
+
+func (u *outUDP) Close() error {
+	defer u.live.forget(u.UDPConn)
+	return u.UDPConn.Close()
 }
 
 // diag 测量本节点到规则各目标的 TCP 建连耗时。

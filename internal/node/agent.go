@@ -64,8 +64,7 @@ type Agent struct {
 	cfgVer   atomic.Int64
 
 	sendCh  chan []byte
-	pending *proto.Report
-	seq     int64
+	traffic *trafficBox
 	metrics *metricsCollector
 }
 
@@ -79,9 +78,13 @@ func (a *Agent) getRole() string {
 
 func (a *Agent) statePath() string { return filepath.Join(a.opt.StateDir, "kaze-node.json") }
 
-func (a *Agent) loadState() {
+func (a *Agent) loadState() error {
 	if b, err := os.ReadFile(a.statePath()); err == nil {
-		json.Unmarshal(b, &a.state)
+		if err = json.Unmarshal(b, &a.state); err != nil {
+			return err
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
 	}
 	if a.opt.UID != "" {
 		a.state.UID = a.opt.UID
@@ -90,29 +93,51 @@ func (a *Agent) loadState() {
 		b := make([]byte, 12)
 		rand.Read(b)
 		a.state.UID = hex.EncodeToString(b)
-		a.saveState()
+		return a.saveState()
 	}
+	return nil
 }
 
-func (a *Agent) saveState() {
+func (a *Agent) saveState() error {
 	a.stateMu.Lock()
 	defer a.stateMu.Unlock()
-	b, _ := json.Marshal(&a.state)
-	os.MkdirAll(a.opt.StateDir, 0o700)
-	tmp := a.statePath() + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err == nil {
-		os.Rename(tmp, a.statePath())
+	b, err := json.Marshal(&a.state)
+	if err != nil {
+		return err
 	}
+	if err = os.MkdirAll(a.opt.StateDir, 0700); err != nil {
+		return err
+	}
+	return writeTrafficAtomic(a.statePath(), b)
 }
 
 // Run 运行节点端直到 ctx 结束。
-func Run(ctx context.Context, opt Options) error {
+func Run(ctx context.Context, opt Options) (runErr error) {
 	if opt.StateDir == "" {
 		opt.StateDir = "."
 	}
-	a := &Agent{opt: opt, sendCh: make(chan []byte, 64), seq: time.Now().UnixMilli()}
+	a := &Agent{opt: opt, sendCh: make(chan []byte, 64)}
 	a.hostname, _ = os.Hostname()
-	a.loadState()
+	// Lock before reading or creating the UID: it is part of the stream identity.
+	var d *os.File
+	if opt.ConfigFile == "" {
+		var err error
+		d, err = openTrafficDir(opt.StateDir)
+		if err != nil {
+			return err
+		}
+		defer d.Close()
+	}
+	if err := a.loadState(); err != nil {
+		return err
+	}
+	if d != nil {
+		var err error
+		a.traffic, err = loadTraffic(opt, a.state.UID, d)
+		if err != nil {
+			return err
+		}
+	}
 	a.in, a.out = newInbound(a), newOutbound(a)
 	a.metrics = newMetricsCollector(opt.Iface)
 	defer a.in.stopAll()
@@ -137,6 +162,32 @@ func Run(ctx context.Context, opt Options) error {
 	if opt.PanelURL == "" || opt.Token == "" {
 		return errors.New("必须指定面板地址 (-u) 和对接令牌 (-t)")
 	}
+	// Checkpoint even when the panel is offline or a previous batch awaits ACK.
+	meterCtx, stopMeter := context.WithCancel(ctx)
+	meterDone := make(chan struct{})
+	go func() {
+		defer close(meterDone)
+		t := time.NewTicker(trafficInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-meterCtx.Done():
+				return
+			case <-t.C:
+				if err := a.traffic.checkpoint(a.in); err != nil {
+					log.Printf("traffic checkpoint: %v", err)
+				}
+			}
+		}
+	}()
+	defer func() {
+		stopMeter()
+		<-meterDone
+		a.in.stopAll()
+		if err := a.traffic.checkpoint(a.in); err != nil {
+			runErr = errors.Join(runErr, err)
+		}
+	}()
 	// 先用上次落盘的配置恢复转发,再去连面板。
 	if c := a.state.LastConfig; c != nil {
 		if err := a.applyConfig(c, false); err == nil {
@@ -190,7 +241,7 @@ func (a *Agent) applyConfig(cfg *proto.NodeConfig, persist bool) error {
 	a.cfgVer.Store(cfg.Version)
 	if persist && err == nil {
 		a.state.LastConfig = cfg
-		a.saveState()
+		return a.saveState()
 	}
 	return err
 }
@@ -259,11 +310,15 @@ func (a *Agent) session(ctx context.Context) error {
 
 	sctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	acks := make(chan int64, 4)
+	acks := make(chan proto.Ack, 4)
+	writerDone := make(chan struct{})
+	defer func() { cancel(); ws.Close(); <-writerDone }()
 	intervalCh := make(chan int, 1)
 
 	// 写协程:控制消息 + 周期性的探针与流量上报
 	go func() {
+		defer close(writerDone)
+		defer cancel()
 		defer ws.Close()
 		metricsT := time.NewTicker(5 * time.Second)
 		defer metricsT.Stop()
@@ -302,22 +357,15 @@ func (a *Agent) session(ctx context.Context) error {
 					interval = n
 					reportT.Reset(time.Duration(n) * time.Second)
 				}
-			case seq := <-acks:
-				if a.pending != nil && a.pending.Seq == seq {
-					a.pending = nil
+			case ack := <-acks:
+				if err := a.traffic.ack(ack); err != nil {
+					log.Printf("traffic ACK checkpoint: %v", err)
 				}
 			case <-reportT.C:
-				if a.getRole() != proto.RoleIn {
-					continue
-				}
-				if a.pending == nil {
-					if items := a.in.collect(); len(items) > 0 {
-						a.seq++
-						a.pending = &proto.Report{Seq: a.seq, Items: items}
+				if a.traffic != nil {
+					if rep := a.traffic.report(); rep != nil && !write(websocket.TextMessage, proto.Pack(proto.TReportV2, rep)) {
+						return
 					}
-				}
-				if a.pending != nil && !write(websocket.TextMessage, proto.Pack(proto.TReport, a.pending)) {
-					return
 				}
 			case <-retryT.C:
 				if a.getRole() == proto.RoleIn && a.in.retryFailed() {
@@ -361,7 +409,7 @@ func (a *Agent) session(ctx context.Context) error {
 			var ack proto.Ack
 			if json.Unmarshal(m.D, &ack) == nil {
 				select {
-				case acks <- ack.Seq:
+				case acks <- ack:
 				case <-sctx.Done():
 				}
 			}

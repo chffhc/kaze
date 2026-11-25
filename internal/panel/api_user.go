@@ -268,7 +268,7 @@ func containsID(list []int64, id int64) bool {
 }
 
 // prepareRule 校验输入并补全默认值。owner 是规则归属用户,old 为编辑时的原规则。
-func (s *Server) prepareRule(q dbq, actor, owner *User, in *ruleInput, old *Rule) (*Rule, error) {
+func (policy *rulePolicy) prepareRule(q dbq, owner *User, in *ruleInput, old *Rule) (*Rule, error) {
 	r := &Rule{
 		UserID: owner.ID, Name: strings.TrimSpace(in.Name), InGroup: in.InGroup, OutGroup: in.OutGroup,
 		ListenPort: in.ListenPort, Proto: in.Proto, LB: in.LB, ProxyProtocol: in.ProxyProtocol,
@@ -305,49 +305,11 @@ func (s *Server) prepareRule(q dbq, actor, owner *User, in *ruleInput, old *Rule
 		r.Targets = append(r.Targets, nt)
 	}
 
-	groups, err := s.accessibleGroups(owner)
-	if err != nil {
+	if err := policy.authorize(owner, r); err != nil {
 		return nil, err
 	}
-	find := func(id int64, typ string) *Group {
-		for _, g := range groups {
-			if g.ID == id && g.Type == typ {
-				return g
-			}
-		}
-		return nil
-	}
-	ig := find(r.InGroup, proto.RoleIn)
-	if ig == nil {
-		return nil, errors.New("入口组不存在或无权使用")
-	}
-	if ig.Config.DisableUDP {
-		if r.Proto == "udp" {
-			return nil, errors.New("该入口组已禁用 UDP")
-		}
-		r.Proto = "tcp"
-	}
-	if r.OutGroup == 0 {
-		if ig.Config.DirectMode == 1 && !actor.IsAdmin() {
-			return nil, errors.New("该入口组不允许直接转发,请选择出口组")
-		}
-	} else {
-		if ig.Config.DirectMode == 2 {
-			return nil, errors.New("该入口组只允许直接转发")
-		}
-		if find(r.OutGroup, proto.RoleOut) == nil {
-			return nil, errors.New("出口组不存在或无权使用")
-		}
-		if len(ig.Config.AllowedOut) > 0 && !containsID(ig.Config.AllowedOut, r.OutGroup) {
-			return nil, errors.New("该入口组不允许使用所选出口组")
-		}
-	}
-
-	// 端口
-	ranges, _ := parsePortRange(ig.Config.PortRange)
-	if len(ranges) == 0 {
-		ranges = [][2]int{{10000, 60000}}
-	}
+	ig := policy.groups[r.InGroup]
+	ranges := rulePortRanges(ig)
 	taken := func(p int) bool {
 		var id int64
 		err := q.QueryRow(`SELECT id FROM rules WHERE in_group=? AND listen_port=?`, r.InGroup, p).Scan(&id)
@@ -370,9 +332,6 @@ func (s *Server) prepareRule(q dbq, actor, owner *User, in *ruleInput, old *Rule
 	} else {
 		if r.ListenPort < 1 || r.ListenPort > 65535 {
 			return nil, errors.New("监听端口无效")
-		}
-		if !actor.IsAdmin() && !portInRange(ranges, r.ListenPort) {
-			return nil, fmt.Errorf("监听端口需在 %s 范围内", ig.Config.PortRange)
 		}
 		if taken(r.ListenPort) {
 			return nil, errors.New("该端口已被其他规则占用")
@@ -398,11 +357,11 @@ func (s *Server) insertRule(q dbq, r *Rule) (int64, error) {
 }
 
 // ruleOwner 确定新规则归属:管理员可替其他用户创建。
-func (s *Server) ruleOwner(actor *User, userID int64) (*User, error) {
+func ruleOwner(q dbq, actor *User, userID int64) (*User, error) {
 	if userID == 0 || userID == actor.ID || !actor.IsAdmin() {
-		return actor, nil
+		userID = actor.ID
 	}
-	u, err := getUser(s.db, userID)
+	u, err := getUser(q, userID)
 	if err != nil {
 		return nil, errors.New("指定的用户不存在")
 	}
@@ -410,20 +369,22 @@ func (s *Server) ruleOwner(actor *User, userID int64) (*User, error) {
 }
 
 func (s *Server) checkQuota(owner *User, adding int) error {
-	if owner.IsAdmin() {
-		return nil
-	}
 	if !owner.Active() {
 		return errors.New("账号当前不可用(未购买套餐、已到期或流量用尽),无法创建规则")
 	}
-	if owner.RuleCount+adding > owner.MaxRules {
+	if !owner.IsAdmin() && owner.RuleCount+adding > owner.MaxRules {
 		return fmt.Errorf("规则数量已达上限(%d 条)", owner.MaxRules)
 	}
 	return nil
 }
 
 func (s *Server) handleRuleList(w http.ResponseWriter, r *http.Request, u *User) {
-	q := `SELECT ` + ruleCols + `, u.username, (CASE WHEN ` + activeUserSQL + ` THEN 1 ELSE 0 END) FROM rules r JOIN users u ON u.id=r.user_id`
+	policy, err := loadRulePolicy(s.db)
+	if err != nil {
+		s.dbErr(w, err)
+		return
+	}
+	q := `SELECT ` + ruleCols + `, u.username,u.role,u.plan_id, (CASE WHEN ` + activeUserSQL + ` THEN 1 ELSE 0 END) FROM rules r JOIN users u ON u.id=r.user_id`
 	args := []any{now()}
 	if !(u.IsAdmin() && r.URL.Query().Get("all") == "1") {
 		q += ` WHERE r.user_id=?`
@@ -440,7 +401,8 @@ func (s *Server) handleRuleList(w http.ResponseWriter, r *http.Request, u *User)
 	for rows.Next() {
 		var active bool
 		var username string
-		x, err := scanRule(rows, &username, &active)
+		var owner User
+		x, err := scanRule(rows, &username, &owner.Role, &owner.PlanID, &active)
 		if err != nil {
 			s.dbErr(w, err)
 			return
@@ -448,11 +410,15 @@ func (s *Server) handleRuleList(w http.ResponseWriter, r *http.Request, u *User)
 		if u.IsAdmin() {
 			x.Username = username
 		}
+		runtimeRule := *x
+		policyErr := policy.authorize(&owner, &runtimeRule)
 		switch {
 		case x.Paused:
 			x.Status = "paused"
 		case !active:
 			x.Status, x.Error = "inactive", "账号不可用(到期、流量用尽或被封禁)"
+		case policyErr != nil:
+			x.Status, x.Error = "inactive", policyErr.Error()
 		case errs[x.ID] != "":
 			x.Status, x.Error = "error", errs[x.ID]
 		case online[x.InGroup] == 0:
@@ -473,7 +439,13 @@ func (s *Server) handleRuleCreate(w http.ResponseWriter, r *http.Request, u *Use
 		s.fail(w, 400, err.Error())
 		return
 	}
-	owner, err := s.ruleOwner(u, in.UserID)
+	tx, err := s.db.Begin()
+	if err != nil {
+		s.dbErr(w, err)
+		return
+	}
+	defer tx.Rollback()
+	owner, err := ruleOwner(tx, u, in.UserID)
 	if err == nil {
 		err = s.checkQuota(owner, 1)
 	}
@@ -481,17 +453,26 @@ func (s *Server) handleRuleCreate(w http.ResponseWriter, r *http.Request, u *Use
 		s.fail(w, 400, err.Error())
 		return
 	}
-	rule, err := s.prepareRule(s.db, u, owner, &in, nil)
+	policy, err := loadRulePolicy(tx)
+	if err != nil {
+		s.dbErr(w, err)
+		return
+	}
+	rule, err := policy.prepareRule(tx, owner, &in, nil)
 	if err != nil {
 		s.fail(w, 400, err.Error())
 		return
 	}
-	id, err := s.insertRule(s.db, rule)
+	id, err := s.insertRule(tx, rule)
 	if err != nil {
 		s.fail(w, http.StatusConflict, "端口冲突,请重试")
 		return
 	}
-	s.hub.Dirty(rule.InGroup, rule.OutGroup)
+	if err := tx.Commit(); err != nil {
+		s.dbErr(w, err)
+		return
+	}
+	s.hub.Dirty()
 	rule.ID = id
 	s.ok(w, rule)
 }
@@ -525,7 +506,12 @@ func (s *Server) handleRuleUpdate(w http.ResponseWriter, r *http.Request, u *Use
 		s.dbErr(w, err)
 		return
 	}
-	rule, err := s.prepareRule(s.db, u, owner, &in, old)
+	policy, err := loadRulePolicy(s.db)
+	if err != nil {
+		s.dbErr(w, err)
+		return
+	}
+	rule, err := policy.prepareRule(s.db, owner, &in, old)
 	if err != nil {
 		s.fail(w, 400, err.Error())
 		return
@@ -538,7 +524,7 @@ func (s *Server) handleRuleUpdate(w http.ResponseWriter, r *http.Request, u *Use
 		s.fail(w, http.StatusConflict, "端口冲突,请重试")
 		return
 	}
-	s.hub.Dirty(old.InGroup, old.OutGroup, rule.InGroup, rule.OutGroup)
+	s.hub.Dirty()
 	s.ok(w, H{"ok": true})
 }
 
@@ -551,7 +537,7 @@ func (s *Server) handleRuleDelete(w http.ResponseWriter, r *http.Request, u *Use
 		s.dbErr(w, err)
 		return
 	}
-	s.hub.Dirty(old.InGroup, old.OutGroup)
+	s.hub.Dirty()
 	s.ok(w, H{"ok": true})
 }
 
@@ -571,7 +557,7 @@ func (s *Server) handleRulePause(w http.ResponseWriter, r *http.Request, u *User
 		s.dbErr(w, err)
 		return
 	}
-	s.hub.Dirty(old.InGroup, old.OutGroup)
+	s.hub.Dirty()
 	s.ok(w, H{"ok": true})
 }
 
@@ -582,6 +568,20 @@ func (s *Server) handleRuleDiag(w http.ResponseWriter, r *http.Request, u *User)
 	}
 	if rule.Paused {
 		s.ok(w, H{"hops": []proto.DiagHop{{From: "面板", To: "-", Error: "规则已暂停,恢复后才能诊断"}}})
+		return
+	}
+	owner, err := getUser(s.db, rule.UserID)
+	if err != nil {
+		s.dbErr(w, err)
+		return
+	}
+	policy, err := loadRulePolicy(s.db)
+	if err != nil {
+		s.dbErr(w, err)
+		return
+	}
+	if !owner.Active() || policy.authorize(owner, rule) != nil {
+		s.fail(w, http.StatusForbidden, "规则当前未获授权")
 		return
 	}
 	hops := s.hub.diag(rule)
@@ -617,16 +617,26 @@ func (s *Server) handleRuleBatch(w http.ResponseWriter, r *http.Request, u *User
 		s.fail(w, 400, "需要 1-500 行规则")
 		return
 	}
-	if err := s.checkQuota(u, len(lines)); err != nil {
-		s.fail(w, 400, err.Error())
-		return
-	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		s.dbErr(w, err)
 		return
 	}
 	defer tx.Rollback()
+	owner, err := getUser(tx, u.ID)
+	if err != nil {
+		s.dbErr(w, err)
+		return
+	}
+	if err = s.checkQuota(owner, len(lines)); err != nil {
+		s.fail(w, 400, err.Error())
+		return
+	}
+	policy, err := loadRulePolicy(tx)
+	if err != nil {
+		s.dbErr(w, err)
+		return
+	}
 	for i, l := range lines {
 		f := strings.Split(l, "#")
 		if len(f) != 4 {
@@ -644,7 +654,7 @@ func (s *Server) handleRuleBatch(w http.ResponseWriter, r *http.Request, u *User
 			Name: f[0], InGroup: in.InGroup, OutGroup: in.OutGroup, ListenPort: port, Proto: in.Proto,
 			Targets: []string{net.JoinHostPort(strings.TrimSpace(f[2]), strings.TrimSpace(f[3]))},
 		}
-		rule, err := s.prepareRule(tx, u, u, &ri, nil)
+		rule, err := policy.prepareRule(tx, owner, &ri, nil)
 		if err == nil {
 			_, err = s.insertRule(tx, rule)
 		}
@@ -657,6 +667,6 @@ func (s *Server) handleRuleBatch(w http.ResponseWriter, r *http.Request, u *User
 		s.dbErr(w, err)
 		return
 	}
-	s.hub.Dirty(in.InGroup, in.OutGroup)
+	s.hub.Dirty()
 	s.ok(w, H{"created": len(lines)})
 }

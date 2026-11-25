@@ -65,6 +65,10 @@ func newInbound(a *Agent) *inbound {
 func (in *inbound) apply(cfg *proto.InboundConfig) {
 	in.mu.Lock()
 	defer in.mu.Unlock()
+	in.applyLocked(cfg)
+}
+
+func (in *inbound) applyLocked(cfg *proto.InboundConfig) {
 	in.last = cfg
 
 	// 1. 隧道客户端
@@ -177,35 +181,37 @@ func (in *inbound) stopLocked(id int64, run *ruleRunner) {
 // retryFailed 重新尝试启动失败的规则(例如端口被占用后又释放)。
 func (in *inbound) retryFailed() bool {
 	in.mu.Lock()
-	n, cfg := len(in.errs), in.last
-	in.mu.Unlock()
-	if n == 0 || cfg == nil {
+	defer in.mu.Unlock()
+	if len(in.errs) == 0 || in.last == nil {
 		return false
 	}
-	in.apply(cfg)
+	in.applyLocked(in.last)
 	return true
 }
 
 // collect 取走自上次以来的流量增量。
 func (in *inbound) collect() []proto.Traffic {
+	var out []proto.Traffic
+	in.collectIf(func(v proto.Traffic) bool { out = append(out, v); return true })
+	return out
+}
+
+// Subtract only accepted snapshots. Concurrent per-packet increments remain live.
+func (in *inbound) collectIf(take func(proto.Traffic) bool) {
 	in.mu.Lock()
 	defer in.mu.Unlock()
-	var out []proto.Traffic
-	for id, run := range in.rules {
-		up, down := run.up.Swap(0), run.down.Swap(0)
-		if o, ok := in.orphan[id]; ok {
-			up, down = up+o[0], down+o[1]
+	for id, o := range in.orphan {
+		if o == [2]int64{} || take(proto.Traffic{RuleID: id, Up: o[0], Down: o[1]}) {
 			delete(in.orphan, id)
 		}
-		if up != 0 || down != 0 {
-			out = append(out, proto.Traffic{RuleID: id, Up: up, Down: down})
+	}
+	for id, run := range in.rules {
+		up, down := run.up.Load(), run.down.Load()
+		if (up != 0 || down != 0) && take(proto.Traffic{RuleID: id, Up: up, Down: down}) {
+			run.up.Add(-up)
+			run.down.Add(-down)
 		}
 	}
-	for id, o := range in.orphan {
-		out = append(out, proto.Traffic{RuleID: id, Up: o[0], Down: o[1]})
-		delete(in.orphan, id)
-	}
-	return out
 }
 
 func (in *inbound) ruleErrors() map[int64]string {
@@ -223,6 +229,8 @@ func (in *inbound) tunnel(gid int64) *tunnel.Client { return (*in.tunMap.Load())
 func (in *inbound) stopAll() {
 	in.mu.Lock()
 	defer in.mu.Unlock()
+	in.last = nil
+	clear(in.errs)
 	for id, run := range in.rules {
 		in.stopLocked(id, run)
 	}
@@ -294,11 +302,9 @@ type ruleRunner struct {
 
 	up, down atomic.Int64
 
-	tcpLn  net.Listener
-	udp    *relay.UDPRelay
-	mu     sync.Mutex
-	conns  map[net.Conn]struct{}
-	closed atomic.Bool
+	tcpLn net.Listener
+	udp   *relay.UDPRelay
+	live  *ruleConns
 }
 
 func bucketUp(l *relay.Limits) *relay.Bucket {
@@ -318,8 +324,7 @@ func bucketDown(l *relay.Limits) *relay.Bucket {
 func (in *inbound) startRule(spec proto.Rule, ulim *relay.Limits, cfg *proto.InboundConfig) (*ruleRunner, error) {
 	r := &ruleRunner{
 		in: in, spec: spec, ulim: ulim,
-		rlim:  relay.NewLimits(spec.SpeedLimit, spec.ConnLimit, spec.IPLimit),
-		conns: make(map[net.Conn]struct{}),
+		rlim: relay.NewLimits(spec.SpeedLimit, spec.ConnLimit, spec.IPLimit),
 	}
 	if spec.OutGroup == 0 {
 		if len(spec.Targets) == 0 {
@@ -355,6 +360,9 @@ func (in *inbound) startRule(spec proto.Rule, ulim *relay.Limits, cfg *proto.Inb
 			DownLimits: [2]*relay.Bucket{bucketDown(r.rlim), bucketDown(r.ulim)},
 			Open:       r.openUDP,
 		}
+	}
+	r.live = newRuleConns()
+	if r.udp != nil {
 		go r.udp.Serve()
 	}
 	if r.tcpLn != nil {
@@ -364,27 +372,20 @@ func (in *inbound) startRule(spec proto.Rule, ulim *relay.Limits, cfg *proto.Inb
 }
 
 func (r *ruleRunner) stop() {
-	if r.closed.Swap(true) {
-		return
-	}
+	r.live.stop()
 	if r.tcpLn != nil {
 		r.tcpLn.Close()
 	}
 	if r.udp != nil {
 		r.udp.Close()
 	}
-	r.mu.Lock()
-	for c := range r.conns {
-		c.Close()
-	}
-	r.mu.Unlock()
 }
 
 func (r *ruleRunner) serveTCP() {
 	for {
 		c, err := r.tcpLn.Accept()
 		if err != nil {
-			if r.closed.Load() {
+			if r.live.ctx.Err() != nil {
 				return
 			}
 			time.Sleep(20 * time.Millisecond) // 文件描述符耗尽等瞬时错误
@@ -410,19 +411,10 @@ func (r *ruleRunner) handle(c net.Conn) {
 	}
 	defer relay.ReleaseAll(src.Addr(), r.rlim, r.ulim)
 
-	r.mu.Lock()
-	if r.closed.Load() {
-		r.mu.Unlock()
-		c.Close()
+	if !r.live.track(c) {
 		return
 	}
-	r.conns[c] = struct{}{}
-	r.mu.Unlock()
-	defer func() {
-		r.mu.Lock()
-		delete(r.conns, c)
-		r.mu.Unlock()
-	}()
+	defer r.live.forget(c)
 
 	var prefix []byte
 	if pol := r.in.policy.Load(); pol != nil {
@@ -433,7 +425,7 @@ func (r *ruleRunner) handle(c net.Conn) {
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
+	ctx, cancel := context.WithTimeout(r.live.ctx, connectTimeout)
 	var target net.Conn
 	var done func()
 	var err error
@@ -457,17 +449,21 @@ func (r *ruleRunner) handle(c net.Conn) {
 		c.Close()
 		return
 	}
+	defer done()
+	if !r.live.track(target) {
+		return
+	}
+	defer r.live.forget(target)
 	relay.Pipe(c, target, &relay.PipeOpts{
 		Up: &r.up, Down: &r.down,
 		UpLimits:   [2]*relay.Bucket{bucketUp(r.rlim), bucketUp(r.ulim)},
 		DownLimits: [2]*relay.Bucket{bucketDown(r.rlim), bucketDown(r.ulim)},
 		Prefix:     prefix,
 	})
-	done()
 }
 
 func (r *ruleRunner) openUDP(client netip.AddrPort, _ uint32) (relay.Upstream, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
+	ctx, cancel := context.WithTimeout(r.live.ctx, connectTimeout)
 	defer cancel()
 	if r.spec.OutGroup == 0 {
 		cands := r.bal.Candidates(relay.HashAddr(client.Addr()))

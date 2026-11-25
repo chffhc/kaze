@@ -48,18 +48,24 @@ type UDPRelay struct {
 	MaxSessions          int
 
 	mu       sync.RWMutex
-	sessions map[netip.AddrPort]*udpSession
+	sessions map[udpSessionKey]*udpSession
 	closed   atomic.Bool
 }
 
-type udpSession struct {
-	r      *UDPRelay
+// A native exit listener is shared: the same source port is not a rule ID.
+type udpSessionKey struct {
 	client netip.AddrPort
 	tag    uint32
-	q      chan *[]byte // 元素的 len 即报文长度
-	last   atomic.Int64
-	quit   chan struct{}
-	once   sync.Once
+}
+
+type udpSession struct {
+	udpSessionKey
+	r    *UDPRelay
+	q    chan *[]byte // 元素的 len 即报文长度
+	last atomic.Int64
+	quit chan struct{}
+	mu   sync.Mutex
+	up   Upstream
 }
 
 // Serve 运行收包循环,直到 Conn 被关闭。
@@ -71,7 +77,7 @@ func (r *UDPRelay) Serve() {
 		r.MaxSessions = defaultMaxUS
 	}
 	r.mu.Lock()
-	r.sessions = make(map[netip.AddrPort]*udpSession)
+	r.sessions = make(map[udpSessionKey]*udpSession)
 	r.mu.Unlock()
 
 	bp := GetUDPBuf()
@@ -98,11 +104,12 @@ func (r *UDPRelay) Serve() {
 			continue
 		}
 		from = netip.AddrPortFrom(from.Addr().Unmap(), from.Port())
+		key := udpSessionKey{client: from, tag: tag}
 		r.mu.RLock()
-		s := r.sessions[from]
+		s := r.sessions[key]
 		r.mu.RUnlock()
 		if s == nil {
-			if s = r.newSession(from, tag); s == nil {
+			if s = r.newSession(key); s == nil {
 				continue
 			}
 		}
@@ -134,34 +141,50 @@ func putSmall(pb *[]byte) {
 	}
 }
 
-func (r *UDPRelay) newSession(from netip.AddrPort, tag uint32) *udpSession {
+func (r *UDPRelay) newSession(key udpSessionKey) *udpSession {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.closed.Load() {
 		return nil
 	}
-	if s := r.sessions[from]; s != nil {
+	if s := r.sessions[key]; s != nil {
 		return s
 	}
 	if len(r.sessions) >= r.MaxSessions {
 		return nil
 	}
-	s := &udpSession{r: r, client: from, tag: tag, q: make(chan *[]byte, udpQueueLen), quit: make(chan struct{})}
+	s := &udpSession{r: r, udpSessionKey: key, q: make(chan *[]byte, udpQueueLen), quit: make(chan struct{})}
 	s.last.Store(time.Now().UnixNano())
-	r.sessions[from] = s
+	r.sessions[key] = s
 	ActiveUDP.Add(1)
 	go s.run()
 	return s
 }
 
-func (s *udpSession) stop() { s.once.Do(func() { close(s.quit) }) }
+// Closing the upstream also wakes a blocked Send. If Open is still in
+// progress, run takes responsibility for closing the late result instead.
+func (s *udpSession) stop() {
+	s.mu.Lock()
+	select {
+	case <-s.quit:
+		s.mu.Unlock()
+		return
+	default:
+		close(s.quit)
+	}
+	up := s.up
+	s.mu.Unlock()
+	if up != nil {
+		up.Close()
+	}
+}
 
 func (s *udpSession) run() {
 	r := s.r
 	defer func() {
 		r.mu.Lock()
-		if r.sessions[s.client] == s {
-			delete(r.sessions, s.client)
+		if r.sessions[s.udpSessionKey] == s {
+			delete(r.sessions, s.udpSessionKey)
 		}
 		r.mu.Unlock()
 		ActiveUDP.Add(-1)
@@ -170,7 +193,17 @@ func (s *udpSession) run() {
 	if err != nil {
 		return
 	}
-	defer up.Close()
+	s.mu.Lock()
+	select {
+	case <-s.quit:
+		s.mu.Unlock()
+		up.Close()
+		return
+	default:
+		s.up = up
+	}
+	s.mu.Unlock()
+	defer s.stop()
 	go s.recvLoop(up)
 	for {
 		select {
@@ -179,7 +212,6 @@ func (s *udpSession) run() {
 			err := up.Send(*pb)
 			putSmall(pb)
 			if err != nil {
-				s.stop()
 				return
 			}
 		case <-s.quit:
