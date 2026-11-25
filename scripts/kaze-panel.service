@@ -1,0 +1,19 @@
+# 面板的 systemd 单元。把 kaze-panel-linux-amd64 放到 /opt/kaze/kaze-panel,
+# 节点端二进制放到 /opt/kaze/dist/,然后:
+#   cp scripts/kaze-panel.service /etc/systemd/system/ && systemctl enable --now kaze-panel
+[Unit]
+Description=Kaze panel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/kaze
+# 面板只监听本机,由 Caddy / Nginx 提供 HTTPS 并反向代理(需支持 WebSocket)
+ExecStart=/opt/kaze/kaze-panel -listen 127.0.0.1:8080 -data /opt/kaze/data -dist /opt/kaze/dist -trust-proxy
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
