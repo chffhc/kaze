@@ -39,6 +39,7 @@ type Options struct {
 	Bind        string // 入站监听绑定的地址,默认全部
 	ConnectHost string // 出口:入口连接本机使用的地址(专线内网 IP 等)
 	TunnelPort  int    // 出口:隧道监听端口
+	RevPort     int    // 入口:反向隧道监听端口(出口主动连入);0 表示不开启
 	Iface       string // 探针统计的网卡,逗号分隔;为空自动选择
 	ConfigFile  string // 独立模式:从本地 JSON 读取 NodeConfig,不连接面板
 	Insecure    bool   // 连接面板时跳过证书校验(仅调试)
@@ -183,7 +184,7 @@ func (a *Agent) applyConfig(cfg *proto.NodeConfig, persist bool) error {
 			return errors.New("出口配置为空")
 		}
 		a.in.stopAll()
-		err = a.out.apply(cfg.Outbound)
+		err = a.out.apply(cfg.Outbound, cfg.GroupID)
 	default:
 		return errors.New("未知的节点角色: " + cfg.Role)
 	}
@@ -253,7 +254,7 @@ func (a *Agent) session(ctx context.Context) error {
 	a.send(proto.THello, proto.Hello{
 		UID: a.state.UID, Hostname: a.hostname, Version: proto.Version,
 		OS: runtime.GOOS, Arch: runtime.GOARCH,
-		ConnectHost: a.opt.ConnectHost, TunnelPort: a.opt.TunnelPort,
+		ConnectHost: a.opt.ConnectHost, TunnelPort: a.opt.TunnelPort, RevPort: a.opt.RevPort,
 	})
 	log.Printf("已连接面板 %s", a.opt.PanelURL)
 
@@ -294,6 +295,11 @@ func (a *Agent) session(ctx context.Context) error {
 				m := a.metrics.sample()
 				m.TCPConns, m.UDPSess = relay.ActiveTCP.Load(), relay.ActiveUDP.Load()
 				m.Goroutine = runtime.NumGoroutine()
+				if a.getRole() == proto.RoleIn {
+					m.RevTotal, m.RevUp = a.in.reverseStatus()
+				} else {
+					m.RevTotal, m.RevUp = a.out.reverseStatus()
+				}
 				if !write(websocket.TextMessage, proto.Pack(proto.TMetrics, m)) {
 					return
 				}

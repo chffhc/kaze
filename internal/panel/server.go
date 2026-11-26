@@ -49,6 +49,8 @@ type Server struct {
 	setMu    sync.RWMutex
 	settings map[string]string
 	limiter  *ipLimiter
+	// ruleMu 串行化规则的创建、修改与删除:端口和 SNI 的占用检查要和随后的写入保持一致。
+	ruleMu sync.Mutex
 }
 
 // H 是 JSON 对象的简写。

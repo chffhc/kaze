@@ -2,3 +2,10 @@ dist/
 data/
 *.db
 *.db-*
+*.bak
+# 迁移测试用的样本库要进仓库
+!internal/panel/testdata/*.db
+__pycache__/
+node_modules/
+package.json
+package-lock.json

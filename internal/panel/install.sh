@@ -6,7 +6,8 @@
 # 可选参数:
 #   -n 名称              服务名与安装目录名,默认 kaze-node(同一台机器多开时改这个)
 #   --port 端口          出口:指定隧道监听端口
-#   --connect-host 地址  出口:指定入口连接本机使用的地址(专线内网 IP 等)
+#   --rev-port 端口      入口:开启反向隧道监听,让内网里的出口主动连进来
+#   --connect-host 地址  指定对端连接本机使用的地址(专线内网 IP 等)
 #   --bind 地址          监听绑定的本机地址
 #   --uninstall          卸载
 # 环境变量:
@@ -20,6 +21,7 @@ while [ $# -gt 0 ]; do
     -t) TOKEN="$2"; shift 2 ;;
     -n) NAME="$2"; shift 2 ;;
     --port) EXTRA="$EXTRA -port $2"; shift 2 ;;
+    --rev-port) EXTRA="$EXTRA -rev-port $2"; shift 2 ;;
     --connect-host) EXTRA="$EXTRA -connect-host $2"; shift 2 ;;
     --bind) EXTRA="$EXTRA -bind $2"; shift 2 ;;
     --uninstall) UNINSTALL=1; shift ;;

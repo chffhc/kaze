@@ -5,15 +5,24 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
+
+	"kaze/internal/proto"
 )
 
-const schema = `
+// 数据库结构版本(PRAGMA user_version)。
+//
+//	0 / 1  1.0.x:rules 表带 UNIQUE(in_group, listen_port)
+//	2      1.1.0:rules 增加 TLS 入站字段,端口唯一性改为"子规则除外"的部分唯一索引;nodes 增加 rev_port
+const schemaVersion = 2
+
+const schemaBase = `
 CREATE TABLE IF NOT EXISTS users (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
   username      TEXT NOT NULL UNIQUE COLLATE NOCASE,
@@ -60,31 +69,9 @@ CREATE TABLE IF NOT EXISTS nodes (
   tunnel_port  INTEGER NOT NULL DEFAULT 0,
   first_seen   INTEGER NOT NULL,
   last_seen    INTEGER NOT NULL,
+  rev_port     INTEGER NOT NULL DEFAULT 0,
   UNIQUE(group_id, uid)
 );
-CREATE TABLE IF NOT EXISTS rules (
-  id             INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id        INTEGER NOT NULL,
-  name           TEXT NOT NULL DEFAULT '',
-  in_group       INTEGER NOT NULL,
-  out_group      INTEGER NOT NULL DEFAULT 0,
-  listen_port    INTEGER NOT NULL,
-  proto          TEXT NOT NULL DEFAULT 'tcp+udp',
-  targets        TEXT NOT NULL DEFAULT '[]',
-  lb             TEXT NOT NULL DEFAULT 'round_robin',
-  proxy_protocol INTEGER NOT NULL DEFAULT 0,
-  speed_limit    INTEGER NOT NULL DEFAULT 0,
-  conn_limit     INTEGER NOT NULL DEFAULT 0,
-  ip_limit       INTEGER NOT NULL DEFAULT 0,
-  paused         INTEGER NOT NULL DEFAULT 0,
-  traffic_up     INTEGER NOT NULL DEFAULT 0,
-  traffic_down   INTEGER NOT NULL DEFAULT 0,
-  created_at     INTEGER NOT NULL,
-  updated_at     INTEGER NOT NULL,
-  UNIQUE(in_group, listen_port)
-);
-CREATE INDEX IF NOT EXISTS idx_rules_user ON rules(user_id);
-CREATE INDEX IF NOT EXISTS idx_rules_out ON rules(out_group);
 CREATE TABLE IF NOT EXISTS plans (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   name        TEXT NOT NULL,
@@ -141,6 +128,44 @@ CREATE TABLE IF NOT EXISTS settings (
 );
 `
 
+// rulesDDL 返回 rules 表的建表语句(全新安装与升级迁移共用同一份定义)。
+// 子规则(tls_mode='child')不监听端口,listen_port 存的是所挂母规则的端口,因此可以重复。
+func rulesDDL(table string) string {
+	return `CREATE TABLE ` + table + ` (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id        INTEGER NOT NULL,
+  name           TEXT NOT NULL DEFAULT '',
+  in_group       INTEGER NOT NULL,
+  out_group      INTEGER NOT NULL DEFAULT 0,
+  listen_port    INTEGER NOT NULL,
+  proto          TEXT NOT NULL DEFAULT 'tcp+udp',
+  targets        TEXT NOT NULL DEFAULT '[]',
+  lb             TEXT NOT NULL DEFAULT 'round_robin',
+  proxy_protocol INTEGER NOT NULL DEFAULT 0,
+  speed_limit    INTEGER NOT NULL DEFAULT 0,
+  conn_limit     INTEGER NOT NULL DEFAULT 0,
+  ip_limit       INTEGER NOT NULL DEFAULT 0,
+  paused         INTEGER NOT NULL DEFAULT 0,
+  traffic_up     INTEGER NOT NULL DEFAULT 0,
+  traffic_down   INTEGER NOT NULL DEFAULT 0,
+  created_at     INTEGER NOT NULL,
+  updated_at     INTEGER NOT NULL,
+  tls_mode       TEXT NOT NULL DEFAULT '',
+  tls_config     TEXT NOT NULL DEFAULT '{}'
+);`
+}
+
+// 1.0.x 的 rules 表里就有的列,迁移时原样拷贝。
+const rulesV1Cols = `id,user_id,name,in_group,out_group,listen_port,proto,targets,lb,proxy_protocol,
+speed_limit,conn_limit,ip_limit,paused,traffic_up,traffic_down,created_at,updated_at`
+
+const rulesIndexes = `
+CREATE INDEX idx_rules_user ON rules(user_id);
+CREATE INDEX idx_rules_out ON rules(out_group);
+CREATE UNIQUE INDEX idx_rules_port ON rules(in_group, listen_port) WHERE tls_mode<>'child';
+CREATE INDEX idx_rules_child ON rules(in_group, listen_port) WHERE tls_mode='child';
+`
+
 func openDB(dir string) (*sql.DB, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
@@ -152,10 +177,101 @@ func openDB(dir string) (*sql.DB, error) {
 		return nil, err
 	}
 	db.SetMaxOpenConns(8)
-	if _, err := db.Exec(schema); err != nil {
-		return nil, fmt.Errorf("初始化数据库失败: %w", err)
+	if err := migrate(db, dir); err != nil {
+		db.Close()
+		return nil, err
 	}
 	return db, nil
+}
+
+// migrate 把数据库带到当前的结构版本:全新安装直接建表;旧版本逐级升级,升级前先留一份备份。
+func migrate(db *sql.DB, dir string) error {
+	var ver, hasRules int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&ver); err != nil {
+		return fmt.Errorf("读取数据库版本失败: %w", err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='rules'`).Scan(&hasRules); err != nil {
+		return fmt.Errorf("读取数据库结构失败: %w", err)
+	}
+	switch {
+	case ver > schemaVersion:
+		return fmt.Errorf("数据库是由更新版本的面板创建的(结构版本 %d,本程序最高支持 %d),请使用对应版本的面板", ver, schemaVersion)
+	case ver == schemaVersion:
+		return nil
+	case hasRules == 0: // 全新安装
+		tx, err := db.Begin()
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback()
+		if _, err := tx.Exec(schemaBase + rulesDDL("rules") + rulesIndexes + fmt.Sprintf("PRAGMA user_version = %d;", schemaVersion)); err != nil {
+			return fmt.Errorf("初始化数据库失败: %w", err)
+		}
+		return tx.Commit()
+	}
+
+	// 1.0.x -> 1.1.0
+	backup := filepath.Join(dir, "kaze.db.v1.bak")
+	if _, err := os.Stat(backup); os.IsNotExist(err) {
+		// VACUUM INTO 得到一份一致的快照(直接拷贝文件会漏掉 WAL 里尚未合并的内容)
+		if _, err := db.Exec(`VACUUM INTO ?`, backup); err != nil {
+			return fmt.Errorf("升级前备份数据库失败: %w", err)
+		}
+	}
+	if err := migrateV2(db); err != nil {
+		return fmt.Errorf("升级数据库结构失败(数据未改动,备份在 %s): %w", backup, err)
+	}
+	log.Printf("数据库结构已升级到版本 %d,升级前的备份保存在 %s", schemaVersion, backup)
+	return nil
+}
+
+// migrateV2 重建 rules 表(SQLite 不能直接去掉表级的 UNIQUE 约束)并给 nodes 加列,整个过程在一个事务里。
+func migrateV2(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	// 规则号会出现在隧道流头和流量上报里,不能因为重建表而被复用:记下自增计数,重建后写回去。
+	var oldSeq int64
+	tx.QueryRow(`SELECT seq FROM sqlite_sequence WHERE name='rules'`).Scan(&oldSeq)
+	var before int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM rules`).Scan(&before); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(schemaBase + `DROP TABLE IF EXISTS rules_v2;` + rulesDDL("rules_v2") +
+		`INSERT INTO rules_v2(` + rulesV1Cols + `) SELECT ` + rulesV1Cols + ` FROM rules;
+		DROP TABLE rules;
+		ALTER TABLE rules_v2 RENAME TO rules;` + rulesIndexes); err != nil {
+		return err
+	}
+	var after int
+	var maxID int64
+	if err := tx.QueryRow(`SELECT COUNT(*), COALESCE(MAX(id),0) FROM rules`).Scan(&after, &maxID); err != nil {
+		return err
+	}
+	if after != before {
+		return fmt.Errorf("规则数量在迁移前后不一致(%d -> %d)", before, after)
+	}
+	if _, err := tx.Exec(`DELETE FROM sqlite_sequence WHERE name='rules'`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`INSERT INTO sqlite_sequence(name, seq) VALUES('rules', ?)`, max(oldSeq, maxID)); err != nil {
+		return err
+	}
+	var hasRev int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('nodes') WHERE name='rev_port'`).Scan(&hasRev); err != nil {
+		return err
+	}
+	if hasRev == 0 {
+		if _, err := tx.Exec(`ALTER TABLE nodes ADD COLUMN rev_port INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, schemaVersion)); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func now() int64 { return time.Now().Unix() }
@@ -242,6 +358,15 @@ type GroupConfig struct {
 	MaxFail          int      `json:"max_fail"`     // 故障转移:连续失败次数
 	FailTimeout      int      `json:"fail_timeout"` // 故障转移:摘除时长(秒)
 
+	// —— 入口组:TLS 入站 ——
+	TLSInboundPolicy  int  `json:"tls_inbound_policy"`   // 0 不限制 / 1 用户只能建 TLS 入站规则 / 2 用户只能建子规则(共享管理员的 TLS 端口)
+	TLSRejectEmptySNI bool `json:"tls_reject_empty_sni"` // TLS 入站拒绝不带 SNI 的握手
+
+	// —— 入口组:反向隧道(出口主动连入本组里以 -rev-port 启动的机器)——
+	ReverseGroups []int64 `json:"reverse_groups"` // 走反向隧道的出口组;[0] = 全部,[0,3,4] = 除 3、4 以外的全部
+	ReverseSNI    string  `json:"reverse_sni"`    // 出口拨入时使用的 TLS SNI
+	ReverseConns  int     `json:"reverse_conns"`  // 每台出口到每台入口保持的连接数
+
 	// —— 通用 ——
 	AllowPrivate bool `json:"allow_private"` // 允许转发目标为内网/本机地址
 
@@ -259,19 +384,42 @@ type GroupConfig struct {
 	CDNTLS        bool   `json:"cdn_tls"`        // CDN 模式下入口到 CDN 是否使用 TLS(wss)
 	UDPOverTCP    bool   `json:"udp_over_tcp"`   // UDP 封装进隧道流
 	FailoverGroup int64  `json:"failover_group"` // 出口故障转移组
+	Fingerprint   string `json:"fingerprint"`    // tls / wss 握手模拟的浏览器指纹(utls),空 = 不伪装
 
-	// —— 出口组密钥材料(仅管理员可见)——
-	TunnelKey string `json:"tunnel_key,omitempty"`
-	CertPEM   string `json:"cert_pem,omitempty"`
-	KeyPEM    string `json:"key_pem,omitempty"`
-	CertPin   string `json:"cert_pin,omitempty"`
+	// —— 链式出口 ——
+	ChainHops []int64 `json:"chain_hops"` // 依次经过的出口组(2~3 个)
+	ChainMux  bool    `json:"chain_mux"`  // 各跳之间是否多路复用(入口到第一跳沿用第一跳出口组自己的设置)
+
+	// —— 密钥材料(仅管理员可见)——
+	TunnelKey  string `json:"tunnel_key,omitempty"` // 出口组:隧道预共享密钥
+	CertPEM    string `json:"cert_pem,omitempty"`   // 出口组:隧道证书
+	KeyPEM     string `json:"key_pem,omitempty"`
+	CertPin    string `json:"cert_pin,omitempty"`
+	RevCertPEM string `json:"rev_cert_pem,omitempty"` // 入口组:反向隧道证书
+	RevKeyPEM  string `json:"rev_key_pem,omitempty"`
+	RevCertPin string `json:"rev_cert_pin,omitempty"`
 }
 
-// Group 是设备组:入口组的多台机器共用一套入口规则,出口组的多台机器之间做负载均衡。
+// matchGroupList 按"设备组列表"的约定判断 id 是否命中:
+// 普通列表表示"只有这些";含 0 表示"全部",此时列表里的其它 ID 是例外。
+func matchGroupList(list []int64, id int64) bool {
+	all, listed := false, false
+	for _, x := range list {
+		if x == 0 {
+			all = true
+		} else if x == id {
+			listed = true
+		}
+	}
+	return all != listed
+}
+
+// Group 是设备组:入口组的多台机器共用一套入口规则,出口组的多台机器之间做负载均衡;
+// 链式出口没有自己的机器,它把 2~3 个出口组串成一条用户可选的线路。
 type Group struct {
 	ID        int64       `json:"id"`
 	Name      string      `json:"name"`
-	Type      string      `json:"type"` // in | out
+	Type      string      `json:"type"` // in | out | chain
 	Token     string      `json:"token,omitempty"`
 	Ratio     float64     `json:"ratio"`
 	Public    bool        `json:"public"`
@@ -327,16 +475,17 @@ type Node struct {
 	Arch        string `json:"arch"`
 	ConnectHost string `json:"connect_host"`
 	TunnelPort  int    `json:"tunnel_port"`
+	RevPort     int    `json:"rev_port"`
 	FirstSeen   int64  `json:"first_seen"`
 	LastSeen    int64  `json:"last_seen"`
 }
 
-const nodeCols = `id,group_id,uid,hostname,ip,version,os,arch,connect_host,tunnel_port,first_seen,last_seen`
+const nodeCols = `id,group_id,uid,hostname,ip,version,os,arch,connect_host,tunnel_port,first_seen,last_seen,rev_port`
 
 func scanNode(r scanner) (*Node, error) {
 	n := &Node{}
 	err := r.Scan(&n.ID, &n.GroupID, &n.UID, &n.Hostname, &n.IP, &n.Version, &n.OS, &n.Arch, &n.ConnectHost,
-		&n.TunnelPort, &n.FirstSeen, &n.LastSeen)
+		&n.TunnelPort, &n.FirstSeen, &n.LastSeen, &n.RevPort)
 	return n, err
 }
 
@@ -379,23 +528,72 @@ type Rule struct {
 	CreatedAt     int64    `json:"created_at"`
 	UpdatedAt     int64    `json:"updated_at"`
 
+	// TLS 入站:"" 普通规则 / tls 独占端口 / parent 母规则 / child 子规则(listen_port 是母规则的端口)
+	TLSMode string  `json:"tls_mode"`
+	TLS     RuleTLS `json:"tls"`
+
 	Status string `json:"status"` // ok / paused / inactive / offline / error
 	Error  string `json:"error,omitempty"`
 }
 
+// RuleTLS 是规则的 TLS 入站设置。
+type RuleTLS struct {
+	SNI          []string `json:"sni"`                // 允许的 SNI;子规则必填,独占端口时为空表示不校验
+	ALPN         []string `json:"alpn"`               // 非空时校验并协商 ALPN
+	CertPEM      string   `json:"cert_pem,omitempty"` // 留空则由入口自动生成自签名证书
+	KeyPEM       string   `json:"key_pem,omitempty"`  // 不会通过接口返回
+	HasKey       bool     `json:"has_key,omitempty"`  // 仅用于接口输出:已保存私钥
+	OriginTLS    bool     `json:"origin_tls"`         // 最后一跳连接目标时再做一层 TLS
+	OriginSNI    string   `json:"origin_sni,omitempty"`
+	OriginVerify bool     `json:"origin_verify"`
+}
+
+// redact 去掉不应通过接口返回的私钥。
+func (r *Rule) redact() *Rule {
+	r.TLS.HasKey = r.TLS.KeyPEM != ""
+	r.TLS.KeyPEM = ""
+	return r
+}
+
+// originTLS 返回下发给节点的回源 TLS 设置(未开启时为 nil)。
+func (r *Rule) originTLS() *proto.OriginTLS {
+	if r.TLSMode == "" || r.TLSMode == proto.TLSModeParent || !r.TLS.OriginTLS {
+		return nil
+	}
+	return &proto.OriginTLS{SNI: r.TLS.OriginSNI, Verify: r.TLS.OriginVerify}
+}
+
+// tlsInbound 返回下发给入口节点的 TLS 入站设置(普通规则为 nil)。
+func (r *Rule) tlsInbound() *proto.TLSInbound {
+	if r.TLSMode == "" {
+		return nil
+	}
+	return &proto.TLSInbound{Mode: r.TLSMode, SNI: r.TLS.SNI, ALPN: r.TLS.ALPN, CertPEM: r.TLS.CertPEM, KeyPEM: r.TLS.KeyPEM}
+}
+
 const ruleCols = `r.id,r.user_id,r.name,r.in_group,r.out_group,r.listen_port,r.proto,r.targets,r.lb,r.proxy_protocol,
-r.speed_limit,r.conn_limit,r.ip_limit,r.paused,r.traffic_up,r.traffic_down,r.created_at,r.updated_at`
+r.speed_limit,r.conn_limit,r.ip_limit,r.paused,r.traffic_up,r.traffic_down,r.created_at,r.updated_at,r.tls_mode,r.tls_config`
 
 func scanRule(r scanner, extra ...any) (*Rule, error) {
 	x := &Rule{}
-	var targets string
+	var targets, tlsCfg string
 	dest := []any{&x.ID, &x.UserID, &x.Name, &x.InGroup, &x.OutGroup, &x.ListenPort, &x.Proto, &targets, &x.LB,
 		&x.ProxyProtocol, &x.SpeedLimit, &x.ConnLimit, &x.IPLimit, &x.Paused, &x.TrafficUp, &x.TrafficDown,
-		&x.CreatedAt, &x.UpdatedAt}
+		&x.CreatedAt, &x.UpdatedAt, &x.TLSMode, &tlsCfg}
 	if err := r.Scan(append(dest, extra...)...); err != nil {
 		return nil, err
 	}
 	json.Unmarshal([]byte(targets), &x.Targets)
+	json.Unmarshal([]byte(tlsCfg), &x.TLS)
+	if x.Targets == nil {
+		x.Targets = []string{}
+	}
+	if x.TLS.SNI == nil {
+		x.TLS.SNI = []string{}
+	}
+	if x.TLS.ALPN == nil {
+		x.TLS.ALPN = []string{}
+	}
 	return x, nil
 }
 

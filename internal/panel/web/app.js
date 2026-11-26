@@ -10,10 +10,12 @@ const store = reactive({
   route: location.hash.slice(1) || '/',
 });
 
+let toastSeq = 0;
 function toast(msg, err) {
-  const t = { id: Math.random(), msg, err };
-  store.toasts.push(t);
-  setTimeout(() => { store.toasts = store.toasts.filter(x => x !== t); }, err ? 5000 : 2600);
+  // 用 id 而不是对象本身来找回这条提示:从响应式数组里取出来的元素是代理对象,和这里的原始对象不相等
+  const id = ++toastSeq;
+  store.toasts.push({ id, msg, err });
+  setTimeout(() => { store.toasts = store.toasts.filter(x => x.id !== id); }, err ? 5000 : 2600);
 }
 
 function setToken(tok) {
@@ -176,15 +178,20 @@ const TrafficChart = {
 const RouteLine = {
   props: { rule: Object, groups: Object },
   setup(props) {
-    const name = id => (props.groups[id] && props.groups[id].name) || ('#' + id);
-    return { name };
+    const group = id => props.groups[id];
+    const name = id => (group(id) && group(id).name) || ('#' + id);
+    return { group, name };
   },
   template: `
   <div class="route" :class="rule.status">
-    <span class="hop">{{ name(rule.in_group) }}<b>:{{ rule.listen_port }}</b></span>
-    <template v-if="rule.out_group"><span class="wire"></span><span class="hop">{{ name(rule.out_group) }}</span></template>
-    <span class="wire"></span>
-    <span class="hop tgt">{{ rule.targets[0] }}<em v-if="rule.targets.length > 1">等 {{ rule.targets.length }} 个</em></span>
+    <span class="hop">{{ name(rule.in_group) }}<b>:{{ rule.listen_port }}</b><em v-if="rule.tls_mode">TLS</em></span>
+    <template v-if="rule.tls_mode === 'parent'"><span class="wire"></span><span class="hop tgt">按 SNI 分给子规则</span></template>
+    <template v-else>
+      <template v-if="rule.out_group"><span class="wire"></span>
+        <span class="hop">{{ name(rule.out_group) }}<em v-if="group(rule.out_group) && group(rule.out_group).type === 'chain'">{{ group(rule.out_group).chain_hops }} 跳</em></span></template>
+      <span class="wire"></span>
+      <span class="hop tgt">{{ rule.targets[0] }}<em v-if="rule.targets.length > 1">等 {{ rule.targets.length }} 个</em><em v-if="rule.tls.origin_tls">TLS</em></span>
+    </template>
   </div>`,
 };
 
@@ -290,19 +297,24 @@ const OverviewPage = {
 // ---- 转发规则 ----
 function blankRule() {
   return { id: 0, name: '', in_group: 0, out_group: 0, listen_port: '', proto: 'tcp+udp', targetsText: '', lb: 'round_robin',
-    proxy_protocol: 0, speed_limit: 0, conn_limit: 0, ip_limit: 0 };
+    proxy_protocol: 0, speed_limit: 0, conn_limit: 0, ip_limit: 0,
+    tls_mode: '', sniText: '', alpnText: '', cert_pem: '', key_pem: '', has_key: false, origin_tls: false, origin_sni: '', origin_verify: false };
 }
+const csv = s => String(s || '').split(/[\s,]+/).map(x => x.trim()).filter(Boolean);
+const tlsModeText = { '': '普通转发', tls: 'TLS 入站(独占一个端口)', child: 'TLS 子规则(共享端口,按 SNI 分流)', parent: '共享 TLS 端口(供子规则挂载)' };
 
 const RulesPage = {
   props: { all: Boolean },
   setup(props) {
     const rules = ref(null), groups = ref([]);
     const form = ref(null), batch = ref(null), diag = ref(null);
+    const isAdmin = computed(() => store.user.role === 'admin');
     const gmap = computed(() => Object.fromEntries(groups.value.map(g => [g.id, g])));
     const inGroups = computed(() => groups.value.filter(g => g.type === 'in'));
-    const outGroups = computed(() => groups.value.filter(g => g.type === 'out'));
+    const outGroups = computed(() => groups.value.filter(g => g.type === 'out' || g.type === 'chain'));
     const load = () => run(async () => { rules.value = await api('GET', '/api/rules' + (props.all ? '?all=1' : '')); });
-    onMounted(() => run(async () => { groups.value = await api('GET', '/api/groups'); }));
+    const loadGroups = () => run(async () => { groups.value = await api('GET', '/api/groups'); });
+    onMounted(loadGroups);
     poll(load, 10000);
 
     // 某个入口组下可选的出口(受"限制出口"与直出策略约束)
@@ -313,35 +325,70 @@ const RulesPage = {
       const allow = g.allowed_out || [];
       return outGroups.value.filter(o => !allow.length || allow.includes(o.id));
     }
-    const canDirect = inId => { const g = gmap.value[inId]; return !g || g.direct_mode !== 1 || store.user.role === 'admin'; };
-    const entry = r => { const g = gmap.value[r.in_group]; return g && g.hosts && g.hosts.length ? g.hosts[0] + ':' + r.listen_port : ''; };
+    const canDirect = inId => { const g = gmap.value[inId]; return !g || g.direct_mode !== 1 || isAdmin.value; };
+    const host = r => { const g = gmap.value[r.in_group]; return g && g.hosts && g.hosts.length ? g.hosts[0] : ''; };
+    const entry = r => host(r) ? host(r) + ':' + r.listen_port : '';
+    const outLabel = g => g.name + '(' + g.ratio + 'x,' + g.transport + ')';
+
+    // 某个入口组下可选的入站方式:受入口组的 TLS 入站策略约束,管理员不受限
+    function modesFor(inId) {
+      const g = gmap.value[inId];
+      if (!g) return [''];
+      const tlsOff = (g.blocked || []).includes('tls');
+      const m = [];
+      if (isAdmin.value || !g.tls_policy) m.push('');
+      if (!tlsOff && (isAdmin.value || g.tls_policy < 2)) m.push('tls');
+      if (!tlsOff && g.tls_ports.length) m.push('child');
+      if (!tlsOff && isAdmin.value) m.push('parent');
+      return m;
+    }
+    // 把表单调整到与所选入口、入站方式相容的状态
+    function settle() {
+      const f = form.value, g = gmap.value[f.in_group];
+      const modes = modesFor(f.in_group);
+      if (!modes.includes(f.tls_mode)) f.tls_mode = modes.length ? modes[0] : '';
+      if (f.tls_mode === 'child' && g && !g.tls_ports.find(p => p.port === Number(f.listen_port))) f.listen_port = g.tls_ports.length ? g.tls_ports[0].port : '';
+      const outs = outsFor(f.in_group);
+      if (f.out_group && !outs.find(o => o.id === f.out_group)) f.out_group = 0;
+      if (!f.out_group && !canDirect(f.in_group)) f.out_group = outs.length ? outs[0].id : 0;
+    }
+    function onModeChange(prev) {
+      const f = form.value;
+      // 子规则的"端口"是共享端口,和普通规则的监听端口不是一回事:切换时清掉
+      if ((prev === 'child') !== (f.tls_mode === 'child')) f.listen_port = '';
+      settle();
+    }
 
     function openNew() {
       const f = blankRule();
       if (inGroups.value.length) f.in_group = inGroups.value[0].id;
-      if (!canDirect(f.in_group)) { const o = outsFor(f.in_group); f.out_group = o.length ? o[0].id : 0; }
       form.value = f;
+      settle();
     }
-    function openEdit(r) { form.value = Object.assign(blankRule(), r, { targetsText: r.targets.join('\n'), listen_port: r.listen_port }); }
-    function onInChange() {
-      const f = form.value, outs = outsFor(f.in_group);
-      if (f.out_group && !outs.find(o => o.id === f.out_group)) f.out_group = 0;
-      if (!f.out_group && !canDirect(f.in_group)) f.out_group = outs.length ? outs[0].id : 0;
+    function openEdit(r) {
+      form.value = Object.assign(blankRule(), r, {
+        targetsText: r.targets.join('\n'), listen_port: r.listen_port,
+        sniText: r.tls.sni.join(', '), alpnText: r.tls.alpn.join(', '), cert_pem: r.tls.cert_pem || '', key_pem: '', has_key: !!r.tls.has_key,
+        origin_tls: r.tls.origin_tls, origin_sni: r.tls.origin_sni || '', origin_verify: r.tls.origin_verify,
+      });
     }
     async function save() {
       const f = form.value;
       const body = { name: f.name, in_group: f.in_group, out_group: f.out_group, listen_port: Number(f.listen_port) || 0, proto: f.proto,
         targets: lines(f.targetsText), lb: f.lb, proxy_protocol: Number(f.proxy_protocol), speed_limit: Number(f.speed_limit) || 0,
-        conn_limit: Number(f.conn_limit) || 0, ip_limit: Number(f.ip_limit) || 0 };
+        conn_limit: Number(f.conn_limit) || 0, ip_limit: Number(f.ip_limit) || 0, tls_mode: f.tls_mode,
+        tls: { sni: csv(f.sniText), alpn: csv(f.alpnText), cert_pem: f.cert_pem, key_pem: f.key_pem,
+          origin_tls: f.origin_tls, origin_sni: f.origin_sni, origin_verify: f.origin_verify } };
       const ok = await run(() => f.id ? api('PUT', '/api/rules/' + f.id, body) : api('POST', '/api/rules', body), f.id ? '规则已保存' : '规则已创建');
-      if (ok) { form.value = null; load(); if (!props.all) refreshUser().catch(() => {}); }
+      if (ok) { form.value = null; load(); loadGroups(); if (!props.all) refreshUser().catch(() => {}); }
     }
     async function togglePause(r) {
-      if (await run(() => api('POST', '/api/rules/' + r.id + '/pause', { paused: !r.paused }), r.paused ? '规则已恢复' : '规则已暂停')) load();
+      if (await run(() => api('POST', '/api/rules/' + r.id + '/pause', { paused: !r.paused }), r.paused ? '规则已恢复' : '规则已暂停')) { load(); loadGroups(); }
     }
     async function remove(r) {
-      if (!confirm('删除规则"' + r.name + '"?端口 ' + r.listen_port + ' 会立即停止转发。')) return;
-      if (await run(() => api('DELETE', '/api/rules/' + r.id), '规则已删除')) { load(); if (!props.all) refreshUser().catch(() => {}); }
+      const what = r.tls_mode === 'child' ? 'SNI ' + r.tls.sni.join('、') + ' 会立即停止转发。' : '端口 ' + r.listen_port + ' 会立即停止转发。';
+      if (!confirm('删除规则"' + r.name + '"?' + what)) return;
+      if (await run(() => api('DELETE', '/api/rules/' + r.id), '规则已删除')) { load(); loadGroups(); if (!props.all) refreshUser().catch(() => {}); }
     }
     async function runDiag(r) {
       diag.value = { rule: r, hops: null };
@@ -353,8 +400,9 @@ const RulesPage = {
       const res = await run(() => api('POST', '/api/rules/batch', batch.value));
       if (res) { toast('已导入 ' + res.created + ' 条规则'); batch.value = null; load(); refreshUser().catch(() => {}); }
     }
-    return { rules, groups, gmap, inGroups, outGroups, form, batch, diag, outsFor, canDirect, entry, openNew, openEdit, onInChange, save,
-      togglePause, remove, runDiag, openBatch, saveBatch, fmt, statusText, statusTag, lbText, copyText, store };
+    const kind = r => r.tls_mode === 'parent' ? '共享 TLS 端口' : r.tls_mode ? 'TLS 入站' : r.proto.toUpperCase();
+    return { rules, groups, gmap, inGroups, outGroups, form, batch, diag, outsFor, canDirect, entry, outLabel, modesFor, settle, onModeChange,
+      openNew, openEdit, save, togglePause, remove, runDiag, openBatch, saveBatch, kind, fmt, statusText, statusTag, lbText, tlsModeText, copyText, store };
   },
   template: `
   <div>
@@ -371,10 +419,13 @@ const RulesPage = {
             <tr v-for="r in rules" :key="r.id">
               <td><div class="rule-name">{{ r.name }}</div>
                 <div class="sub"><template v-if="all">{{ r.username }}</template>
-                  <button v-else-if="entry(r)" class="link muted num" style="padding:0" title="复制入口地址" @click="copyText(entry(r))">{{ entry(r) }}</button>
-                  <span class="dim proto">{{ r.proto.toUpperCase() }}</span></div></td>
-              <td><route-line :rule="r" :groups="gmap"></route-line><div class="rule-err" v-if="r.error">{{ r.error }}</div></td>
-              <td class="r num updown"><div>{{ fmt.bytes(r.traffic_up) }}</div><div>{{ fmt.bytes(r.traffic_down) }}</div></td>
+                  <button v-else-if="entry(r)" class="link muted num" style="padding:0" title="复制入口地址" @click="copyText(entry(r))">{{ entry(r) }}</button></div>
+                <div class="sub dim kind">{{ kind(r) }}</div></td>
+              <td><route-line :rule="r" :groups="gmap"></route-line>
+                <div class="sub kind" style="margin-top:4px" v-if="r.tls.sni.length">SNI
+                  <button v-for="n in r.tls.sni" :key="n" class="link muted num" title="复制 SNI" @click="copyText(n)">{{ n }}</button></div>
+                <div class="rule-err" v-if="r.error">{{ r.error }}</div></td>
+              <td class="r num updown"><template v-if="r.tls_mode !== 'parent'"><div>{{ fmt.bytes(r.traffic_up) }}</div><div>{{ fmt.bytes(r.traffic_down) }}</div></template></td>
               <td><span class="tag" :class="statusTag[r.status]">{{ statusText[r.status] }}</span></td>
               <td class="ops">
                 <button class="link" @click="runDiag(r)">诊断</button>
@@ -390,42 +441,81 @@ const RulesPage = {
 
     <modal v-if="form" :title="form.id ? '编辑规则' : '新建规则'" @close="form = null">
       <form id="rule-form" @submit.prevent="save">
-        <div class="field"><label>名称</label><input type="text" v-model.trim="form.name" maxlength="64" placeholder="留空则按端口自动命名"></div>
+        <div class="field"><label>名称</label><input type="text" v-model.trim="form.name" maxlength="64" placeholder="留空则自动命名"></div>
         <div class="grid2">
           <div class="field"><label>入口</label>
-            <select v-model.number="form.in_group" @change="onInChange">
+            <select v-model.number="form.in_group" @change="settle">
               <option v-for="g in inGroups" :key="g.id" :value="g.id">{{ g.name }}({{ g.ratio }}x)</option>
-            </select>
+            </select></div>
+          <div class="field"><label>入站方式</label>
+            <select :value="form.tls_mode" @change="e => { const prev = form.tls_mode; form.tls_mode = e.target.value; onModeChange(prev); }">
+              <option v-for="m in modesFor(form.in_group)" :key="m" :value="m">{{ tlsModeText[m] }}</option>
+            </select></div>
+        </div>
+        <p class="hint" style="margin:-6px 0 14px" v-if="form.tls_mode === 'tls'">入口在这个端口上完成 TLS 握手,把解密后的流量送往目标。客户端要用 TLS 连接入口。</p>
+        <p class="hint" style="margin:-6px 0 14px" v-else-if="form.tls_mode === 'child'">多条规则共用一个 TLS 端口,入口按客户端握手时带的 SNI 决定交给哪条规则。</p>
+        <p class="hint" style="margin:-6px 0 14px" v-else-if="form.tls_mode === 'parent'">只负责监听端口和完成 TLS 握手,自己不转发。用户可以把子规则挂到这个端口上。</p>
+
+        <div class="grid2">
+          <div class="field" v-if="form.tls_mode === 'child'"><label>共享 TLS 端口</label>
+            <select v-model.number="form.listen_port">
+              <option v-for="p in (gmap[form.in_group] ? gmap[form.in_group].tls_ports : [])" :key="p.port" :value="p.port">{{ p.port }}({{ p.name }})</option>
+            </select></div>
+          <div class="field" v-else><label>监听端口</label><input type="number" v-model="form.listen_port" min="0" max="65535" placeholder="留空自动分配">
             <div class="hint" v-if="gmap[form.in_group]">可用端口 {{ gmap[form.in_group].port_range }}</div></div>
-          <div class="field"><label>出口</label>
+          <div class="field" v-if="form.tls_mode !== 'parent'"><label>出口</label>
             <select v-model.number="form.out_group">
               <option v-if="canDirect(form.in_group)" :value="0">直接转发(不经出口)</option>
-              <option v-for="g in outsFor(form.in_group)" :key="g.id" :value="g.id">{{ g.name }}({{ g.ratio }}x,{{ g.transport }})</option>
+              <option v-for="g in outsFor(form.in_group)" :key="g.id" :value="g.id">{{ outLabel(g) }}</option>
             </select>
             <div class="hint">计费倍率为入口与出口之和</div></div>
         </div>
-        <div class="grid2">
-          <div class="field"><label>监听端口</label><input type="number" v-model="form.listen_port" min="0" max="65535" placeholder="留空自动分配"></div>
-          <div class="field"><label>协议</label>
-            <select v-model="form.proto"><option value="tcp+udp">TCP + UDP</option><option value="tcp">仅 TCP</option><option value="udp">仅 UDP</option></select></div>
-        </div>
-        <div class="field"><label>转发目标</label>
-          <textarea class="code" rows="3" v-model="form.targetsText" placeholder="example.com:443" required></textarea>
-          <div class="hint">每行一个 主机:端口。填多个时按下面的策略做负载均衡。</div></div>
-        <details class="more" :open="form.lb !== 'round_robin' || form.proxy_protocol || form.speed_limit || form.conn_limit || form.ip_limit">
-          <summary>负载均衡、PROXY protocol 与限制</summary>
+
+        <template v-if="form.tls_mode === 'tls' || form.tls_mode === 'child'">
           <div class="grid2">
-            <div class="field"><label>多目标策略</label><select v-model="form.lb"><option v-for="(t, k) in lbText" :key="k" :value="k">{{ t }}</option></select></div>
-            <div class="field"><label>PROXY protocol</label><select v-model.number="form.proxy_protocol"><option :value="0">关闭</option><option :value="1">v1</option><option :value="2">v2</option></select>
-              <div class="hint">向目标传递访客真实 IP,目标需支持</div></div>
+            <div class="field"><label>SNI</label><input type="text" v-model.trim="form.sniText" :required="form.tls_mode === 'child'" placeholder="app.example.com">
+              <div class="hint">{{ form.tls_mode === 'child' ? '只有带这个 SNI 的连接会交给这条规则,多个用逗号分隔。' : '只接受带这些 SNI 的连接,多个用逗号分隔;留空则不检查。' }}
+                <template v-if="gmap[form.in_group] && (gmap[form.in_group].allowed_hosts || []).length">该入口只允许以 {{ gmap[form.in_group].allowed_hosts.join('、') }} 结尾的域名。</template></div></div>
+            <div class="field"><label>ALPN</label><input type="text" v-model.trim="form.alpnText" placeholder="h2, http/1.1">
+              <div class="hint">留空则不协商。填了以后,客户端声明的协议必须在其中。</div></div>
           </div>
-          <div class="grid3">
-            <div class="field"><label>限速 (Mbps)</label><input type="number" min="0" v-model="form.speed_limit"></div>
-            <div class="field"><label>连接数</label><input type="number" min="0" v-model="form.conn_limit"></div>
-            <div class="field"><label>来源 IP 数</label><input type="number" min="0" v-model="form.ip_limit"></div>
+          <div class="grid2">
+            <div class="field"><label>送到目标时</label>
+              <select v-model="form.origin_tls"><option :value="false">明文(入口已解密)</option><option :value="true">再用 TLS 加密一次</option></select></div>
+            <div class="field" v-if="form.origin_tls"><label>目标的 SNI</label><input type="text" v-model.trim="form.origin_sni" placeholder="留空则用目标主机名">
+              <label class="check" style="margin:8px 0 0"><input type="checkbox" v-model="form.origin_verify">校验目标的证书</label></div>
           </div>
-          <div class="hint">填 0 表示不限。规则级限制与账号级限制同时生效。</div>
+        </template>
+        <details class="more" v-if="form.tls_mode" :open="!!form.cert_pem">
+          <summary>使用自己的证书</summary>
+          <div class="field"><label>证书 (PEM)</label><textarea class="code" rows="4" v-model="form.cert_pem" spellcheck="false" placeholder="-----BEGIN CERTIFICATE-----"></textarea></div>
+          <div class="field"><label>私钥 (PEM)</label><textarea class="code" rows="4" v-model="form.key_pem" spellcheck="false" :placeholder="form.has_key ? '已保存,留空则不修改' : '-----BEGIN PRIVATE KEY-----'"></textarea>
+            <div class="hint">{{ form.tls_mode === 'parent' ? '没有自带证书的子规则会用这张证书(适合通配符证书)。留空则为每条子规则自动签发自签名证书。' : '留空则由入口自动签发自签名证书,客户端需要关闭证书校验。' }}</div></div>
         </details>
+
+        <template v-if="form.tls_mode !== 'parent'">
+          <div class="grid2" v-if="!form.tls_mode">
+            <div class="field"><label>协议</label>
+              <select v-model="form.proto"><option value="tcp+udp">TCP + UDP</option><option value="tcp">仅 TCP</option><option value="udp">仅 UDP</option></select></div>
+          </div>
+          <div class="field"><label>转发目标</label>
+            <textarea class="code" rows="3" v-model="form.targetsText" placeholder="example.com:443" required></textarea>
+            <div class="hint">每行一个 主机:端口。填多个时按下面的策略做负载均衡。</div></div>
+          <details class="more" :open="form.lb !== 'round_robin' || form.proxy_protocol || form.speed_limit || form.conn_limit || form.ip_limit">
+            <summary>负载均衡、PROXY protocol 与限制</summary>
+            <div class="grid2">
+              <div class="field"><label>多目标策略</label><select v-model="form.lb"><option v-for="(t, k) in lbText" :key="k" :value="k">{{ t }}</option></select></div>
+              <div class="field"><label>PROXY protocol</label><select v-model.number="form.proxy_protocol"><option :value="0">关闭</option><option :value="1">v1</option><option :value="2">v2</option></select>
+                <div class="hint">向目标传递访客真实 IP,目标需支持</div></div>
+            </div>
+            <div class="grid3">
+              <div class="field"><label>限速 (Mbps)</label><input type="number" min="0" v-model="form.speed_limit"></div>
+              <div class="field"><label>连接数</label><input type="number" min="0" v-model="form.conn_limit"></div>
+              <div class="field"><label>来源 IP 数</label><input type="number" min="0" v-model="form.ip_limit"></div>
+            </div>
+            <div class="hint">填 0 表示不限。规则级限制与账号级限制同时生效。</div>
+          </details>
+        </template>
       </form>
       <template #foot><button class="btn" @click="form = null">取消</button><button class="btn primary" form="rule-form">{{ form.id ? '保存规则' : '创建规则' }}</button></template>
     </modal>
@@ -437,17 +527,17 @@ const RulesPage = {
       </div>
       <div class="field"><label>规则列表</label>
         <textarea class="code" rows="8" v-model="batch.text" placeholder="名称#监听端口#目标地址#目标端口&#10;游戏服##203.0.113.8#25565"></textarea>
-        <div class="hint">每行一条,监听端口留空则自动分配。任意一行有误时整批都不会导入。</div></div>
+        <div class="hint">每行一条普通转发规则,监听端口留空则自动分配。任意一行有误时整批都不会导入。</div></div>
       <template #foot><button class="btn" @click="batch = null">取消</button><button class="btn primary" @click="saveBatch">导入规则</button></template>
     </modal>
 
     <modal v-if="diag" :title="'链路诊断:' + diag.rule.name" @close="diag = null">
-      <p class="sub" v-if="!diag.hops">正在让各节点测量到下一跳的 TCP 建连耗时…</p>
+      <p class="sub" v-if="!diag.hops">正在让各节点测量到下一跳的连通情况…</p>
       <table v-else-if="diag.hops.length">
-        <thead><tr><th>从</th><th>到</th><th class="r">建连耗时</th></tr></thead>
+        <thead><tr><th>从</th><th>到</th><th class="r">耗时</th></tr></thead>
         <tbody><tr v-for="(h, i) in diag.hops" :key="i">
           <td>{{ h.from }}</td><td>{{ h.to }}</td>
-          <td class="r"><span v-if="h.error" class="tag bad" style="white-space:normal">{{ h.error }}</span><span v-else class="num">{{ h.ms.toFixed(1) }} ms</span></td>
+          <td class="r"><span v-if="h.error" class="tag bad" style="white-space:normal">{{ h.error }}</span><span v-else-if="h.ms" class="num">{{ h.ms.toFixed(1) }} ms</span><span v-else class="tag ok">正常</span></td>
         </tr></tbody>
       </table>
       <p class="sub" v-else>没有拿到诊断结果,入口或出口节点可能不在线。</p>
@@ -476,6 +566,8 @@ const StatusPage = {
           <tbody>
             <tr v-for="n in g.nodes" :key="n.id">
               <td><span class="dot" :class="n.online ? 'on' : 'off'"></span>{{ n.hostname || '未命名' }}<span class="sub num" v-if="n.ip"> {{ n.ip }}</span>
+                <span class="tag" :class="n.metrics.rev_up < n.metrics.rev_total ? 'warn' : 'ok'" v-if="n.online && n.metrics && n.metrics.rev_total"
+                  :title="g.type === 'in' ? '已有出口接入的出口组数 / 允许接入的出口组数' : '已连上的入口机器数 / 需要连入的入口机器数'">反向隧道 {{ n.metrics.rev_up || 0 }}/{{ n.metrics.rev_total }}</span>
                 <div class="rule-err" v-if="n.error">{{ n.error }}</div></td>
               <template v-if="n.online && n.metrics">
                 <td><span class="meter" :class="{hot: n.metrics.cpu > 80}"><i :style="{width: n.metrics.cpu + '%'}"></i></span><span class="num">{{ n.metrics.cpu.toFixed(0) }}%</span></td>

@@ -1,22 +1,69 @@
 // kaze-bench 是配套的压测工具:自带目标服务端(下载/上传/回显)与三种压测客户端。
 //
 //	kaze-bench server -l :9000                     启动目标服务端(TCP + UDP 回显)
+//	kaze-bench server -l :9443 -tls                目标服务端改为 TLS(自签名证书),用来测"回源 TLS"
 //	kaze-bench tcp  -a host:port -c 8 -d 10s -m down   TCP 吞吐(down/up)
 //	kaze-bench conn -a host:port -c 64 -d 10s          新建连接速率与首字节延迟
 //	kaze-bench udp  -a host:port -c 4 -d 5s -s 1200    UDP 回显吞吐与丢包
+//
+// tcp / conn 加上 -tls [-sni 域名] [-alpn h2,http/1.1] 后以 TLS 连接被测端口(不校验证书),用来测 TLS 入站规则。
 package main
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"flag"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
+
+// selfSigned 生成一张临时的自签名证书(只用于 server -tls)。
+func selfSigned() (tls.Certificate, error) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	tpl := &x509.Certificate{
+		SerialNumber: big.NewInt(time.Now().UnixNano()), Subject: pkix.Name{CommonName: "bench.local"}, DNSNames: []string{"bench.local"},
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().AddDate(1, 0, 0),
+		KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tpl, tpl, &key.PublicKey, key)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}, nil
+}
+
+// dial 连接被测地址;clientTLS 非 nil 时在其上完成 TLS 握手。
+var clientTLS *tls.Config
+
+func dial(addr string) (net.Conn, error) {
+	c, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil || clientTLS == nil {
+		return c, err
+	}
+	tc := tls.Client(c, clientTLS)
+	c.SetDeadline(time.Now().Add(5 * time.Second))
+	if err := tc.Handshake(); err != nil {
+		c.Close()
+		return nil, err
+	}
+	c.SetDeadline(time.Time{})
+	return tc, nil
+}
 
 func main() {
 	if len(os.Args) < 2 {
@@ -30,10 +77,19 @@ func main() {
 	dur := fs.Duration("d", 10*time.Second, "持续时间")
 	mode := fs.String("m", "down", "tcp 模式: down / up")
 	size := fs.Int("s", 1200, "udp 报文大小")
+	useTLS := fs.Bool("tls", false, "server: 以 TLS 提供服务;tcp/conn: 以 TLS 连接被测端口")
+	sni := fs.String("sni", "", "tcp/conn 配合 -tls: 握手时发送的 SNI")
+	alpn := fs.String("alpn", "", "tcp/conn 配合 -tls: 握手时声明的 ALPN,逗号分隔")
 	fs.Parse(os.Args[2:])
+	if *useTLS && os.Args[1] != "server" {
+		clientTLS = &tls.Config{ServerName: *sni, InsecureSkipVerify: true}
+		if *alpn != "" {
+			clientTLS.NextProtos = strings.Split(*alpn, ",")
+		}
+	}
 	switch os.Args[1] {
 	case "server":
-		server(*listen)
+		server(*listen, *useTLS)
 	case "tcp":
 		benchTCP(*addr, *conc, *dur, *mode)
 	case "conn":
@@ -47,11 +103,19 @@ func main() {
 }
 
 // 服务端协议:客户端先发 1 字节。'D' = 服务端持续发送;'U' = 服务端只收;'E' = 回显。
-func server(listen string) {
+func server(listen string, useTLS bool) {
 	ln, err := net.Listen("tcp", listen)
 	if err != nil {
 		fmt.Println(err)
 		os.Exit(1)
+	}
+	if useTLS {
+		cert, err := selfSigned()
+		if err != nil {
+			fmt.Println(err)
+			os.Exit(1)
+		}
+		ln = tls.NewListener(ln, &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{"h2", "http/1.1"}})
 	}
 	if ua, err := net.ResolveUDPAddr("udp", listen); err == nil {
 		if uc, err := net.ListenUDP("udp", ua); err == nil {
@@ -108,7 +172,7 @@ func benchTCP(addr string, conc int, dur time.Duration, mode string) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			c, err := net.DialTimeout("tcp", addr, 5*time.Second)
+			c, err := dial(addr)
 			if err != nil {
 				fmt.Println("连接失败:", err)
 				return
@@ -158,7 +222,7 @@ func benchConn(addr string, conc int, dur time.Duration) {
 			var b [1]byte
 			for time.Now().Before(deadline) {
 				t0 := time.Now()
-				c, err := net.DialTimeout("tcp", addr, 5*time.Second)
+				c, err := dial(addr)
 				if err != nil {
 					fail.Add(1)
 					continue
@@ -166,7 +230,11 @@ func benchConn(addr string, conc int, dur time.Duration) {
 				c.SetDeadline(time.Now().Add(5 * time.Second))
 				c.Write([]byte{'E'})
 				_, err = io.ReadFull(c, b[:])
-				if tc, isTCP := c.(*net.TCPConn); isTCP {
+				raw := c
+				if tc, isTLS := c.(*tls.Conn); isTLS {
+					raw = tc.NetConn()
+				}
+				if tc, isTCP := raw.(*net.TCPConn); isTCP {
 					tc.SetLinger(0) // 避免压测机本地端口耗尽在 TIME_WAIT 上
 				}
 				c.Close()

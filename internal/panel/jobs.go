@@ -2,15 +2,9 @@ package panel
 
 import (
 	"context"
-	"crypto/sha256"
 	"log"
 	"time"
 )
-
-func sha256Sum(b []byte) []byte {
-	s := sha256.Sum256(b)
-	return s[:]
-}
 
 // jobs 是面板的后台任务:到期处理、自动续费、数据清理。
 func (s *Server) jobs(ctx context.Context) {

@@ -4,106 +4,20 @@
 
 用法: python3 scripts/e2e.py <二进制目录>     (目录里需要有 kaze-panel / kaze-node / kaze-bench)
 """
-import json, os, shutil, socket, subprocess, sys, tempfile, time, urllib.request, urllib.error
+import json, os, sys, time
 
-BIN = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else "dist")
-PANEL = "http://127.0.0.1:18080"
-TARGET = 19000
-work = tempfile.mkdtemp(prefix="kaze-e2e-")
-procs = []
-passed = 0
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from kzlib import Env
 
-
-def spawn(name, *args, env=None):
-    log = open(os.path.join(work, name + ".log"), "w")
-    p = subprocess.Popen(list(args), stdout=log, stderr=subprocess.STDOUT, env={**os.environ, **(env or {})})
-    procs.append(p)
-    return p
-
-
-def api(method, path, body=None, token=None, expect=200):
-    req = urllib.request.Request(PANEL + path, method=method,
-                                 data=json.dumps(body).encode() if body is not None else None)
-    req.add_header("Content-Type", "application/json")
-    if token:
-        req.add_header("Authorization", "Bearer " + token)
-    try:
-        with urllib.request.urlopen(req, timeout=15) as r:
-            code, data = r.status, r.read()
-    except urllib.error.HTTPError as e:
-        code, data = e.code, e.read()
-    out = json.loads(data) if data else None
-    if code != expect:
-        raise AssertionError(f"{method} {path} -> {code} {out} (期望 {expect})")
-    return out
-
-
-def check(name, cond, detail=""):
-    global passed
-    if not cond:
-        raise AssertionError(f"✗ {name} {detail}")
-    passed += 1
-    print(f"  ✓ {name} {detail}")
-
-
-def wait(cond, timeout=15, what=""):
-    end = time.time() + timeout
-    while time.time() < end:
-        try:
-            v = cond()
-            if v:
-                return v
-        except Exception:
-            pass
-        time.sleep(0.3)
-    raise AssertionError("等待超时: " + what)
-
-
-def port_open(port):
-    try:
-        socket.create_connection(("127.0.0.1", port), timeout=1).close()
-        return True
-    except OSError:
-        return False
-
-
-def echo(port, n=200_000):
-    s = socket.create_connection(("127.0.0.1", port), timeout=5)
-    s.settimeout(10)
-    payload = b"E" + os.urandom(n)
-    s.sendall(payload)
-    got = b""
-    while len(got) < len(payload):
-        chunk = s.recv(65536)
-        if not chunk:
-            break
-        got += chunk
-    s.close()
-    return got == payload
-
-
-def udp_echo(port):
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.settimeout(1)
-    for _ in range(8):
-        msg = os.urandom(600)
-        s.sendto(msg, ("127.0.0.1", port))
-        try:
-            if s.recv(4096) == msg:
-                return True
-        except socket.timeout:
-            pass
-    return False
-
-
-def bench(*args):
-    return subprocess.run([os.path.join(BIN, "kaze-bench"), *args], capture_output=True, text=True, timeout=120).stdout.strip()
+env = Env(18080)
+BIN, PANEL, TARGET = env.bin, env.panel, 19000
+spawn, api, check, wait, bench = env.spawn, env.api, env.check, env.wait, env.bench
+port_open, echo, udp_echo = env.port_open, env.echo, env.udp_echo
 
 
 def main():
-    print("工作目录:", work)
     spawn("target", os.path.join(BIN, "kaze-bench"), "server", "-l", f"127.0.0.1:{TARGET}")
-    spawn("panel", os.path.join(BIN, "kaze-panel"), "-listen", "127.0.0.1:18080", "-data", os.path.join(work, "data"),
+    spawn("panel", os.path.join(BIN, "kaze-panel"), "-listen", "127.0.0.1:18080", "-data", os.path.join(env.work, "data"),
           "-dist", BIN, "-admin-pass", "admin-e2e-pass")
     wait(lambda: api("GET", "/api/site"), what="面板启动")
 
@@ -123,12 +37,12 @@ def main():
     print("[2] 节点对接")
     for name, g in (("in", gin), ("out", gout), ("ws", gws)):
         spawn("node-" + name, os.path.join(BIN, "kaze-node"), "-u", PANEL, "-t", g["token"],
-              "-state", os.path.join(work, "node-" + name), "-bind", "127.0.0.1", "-connect-host", "127.0.0.1")
+              "-state", os.path.join(env.work, "node-" + name), "-bind", "127.0.0.1", "-connect-host", "127.0.0.1")
     wait(lambda: sum(1 for n in api("GET", "/api/admin/nodes", token=admin) if n["online"]) == 3, what="节点上线")
     wait(lambda: all(n["tunnel_port"] for n in api("GET", "/api/admin/nodes", token=admin) if n["group_id"] != gin["id"]),
          what="出口上报隧道端口")
     check("三个节点全部在线,出口已上报隧道端口", True)
-    spawn("node-bad", os.path.join(BIN, "kaze-node"), "-u", PANEL, "-t", "deadbeef", "-state", os.path.join(work, "bad"))
+    spawn("node-bad", os.path.join(BIN, "kaze-node"), "-u", PANEL, "-t", "deadbeef", "-state", os.path.join(env.work, "bad"))
 
     print("[3] 用户、套餐与兑换码")
     plan = None
@@ -215,33 +129,12 @@ def main():
     check("用户级限速 8 Mbps", 0.5 <= mbs <= 1.6, f"(实测 {mbs*8:.1f} Mbps)")
 
     print("[8] 面板重启后节点自动重连")
-    procs[1].terminate(); procs[1].wait()
+    env.stop("panel")
     check("面板停机期间转发不中断", echo(r3["listen_port"], 1000))
-    spawn("panel2", os.path.join(BIN, "kaze-panel"), "-listen", "127.0.0.1:18080", "-data", os.path.join(work, "data"), "-dist", BIN)
+    spawn("panel", os.path.join(BIN, "kaze-panel"), "-listen", "127.0.0.1:18080", "-data", os.path.join(env.work, "data"), "-dist", BIN)
     wait(lambda: api("GET", "/api/site"), what="面板重启")
     wait(lambda: sum(1 for n in api("GET", "/api/admin/nodes", token=admin) if n["online"]) == 3, 60, "节点重连")
     check("节点已自动重连", True)
 
-    print(f"\n全部通过: {passed} 项检查")
 
-
-try:
-    main()
-    code = 0
-except Exception as e:
-    print("\n失败:", e)
-    for name in ("panel", "node-in", "node-out", "node-ws"):
-        p = os.path.join(work, name + ".log")
-        if os.path.exists(p):
-            print(f"--- {name}.log (末尾) ---")
-            print("".join(open(p, errors="replace").readlines()[-15:]))
-    code = 1
-finally:
-    for p in procs:
-        try:
-            p.terminate()
-        except Exception:
-            pass
-    time.sleep(0.5)
-    shutil.rmtree(work, ignore_errors=True)
-sys.exit(code)
+env.run(main)
