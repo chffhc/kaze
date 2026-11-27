@@ -84,14 +84,14 @@ func (s *Server) purchase(userID, planID int64, typ string) error {
 	if u.Balance < p.Price {
 		return errors.New("余额不足,请先充值")
 	}
-	if _, err := tx.Exec(`UPDATE users SET balance=balance-? WHERE id=?`, p.Price, u.ID); err != nil {
+	if err := shopWriteOne(tx, `UPDATE users SET balance=balance-? WHERE id=? AND balance>=?`, p.Price, u.ID, p.Price); err != nil {
 		return err
 	}
 	if err := applyPlan(tx, u, p); err != nil {
 		return err
 	}
 	t := now()
-	if _, err := tx.Exec(`INSERT INTO orders(order_no,user_id,type,plan_id,amount,status,pay_method,note,created_at,paid_at)
+	if err := shopWriteOne(tx, `INSERT INTO orders(order_no,user_id,type,plan_id,amount,status,pay_method,note,created_at,paid_at)
 		VALUES(?,?,?,?,?,'paid','balance',?,?,?)`, orderNo(), u.ID, typ, p.ID, p.Price, p.Name, t, t); err != nil {
 		return err
 	}
@@ -319,6 +319,11 @@ func (s *Server) handleEpayNotify(w http.ResponseWriter, r *http.Request) {
 	}
 	if status == "paid" {
 		w.Write([]byte("success"))
+		return
+	}
+	if status != "pending" {
+		log.Printf("[支付] 非待支付订单 %s 收到成功回调，需要人工核对", p["out_trade_no"])
+		http.Error(w, "fail", http.StatusConflict)
 		return
 	}
 	money, _ := strconv.ParseFloat(p["money"], 64)

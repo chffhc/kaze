@@ -59,69 +59,14 @@ func (h *Hub) ingest(gid int64, uid string, rep *proto.Report) error {
 	hour := now() / 3600 * 3600
 	crossed := false
 	for _, it := range rep.Items {
-		if it.RuleID <= 0 || it.Up < 0 || it.Down < 0 || it.Up > math.MaxInt64-it.Down {
-			return errors.New("invalid traffic delta")
-		}
-		raw := it.Up + it.Down
-		if raw == 0 {
+		if it.Up == 0 && it.Down == 0 && it.RuleID > 0 {
 			continue
 		}
-		var user, out int64
-		err = tx.QueryRow(`SELECT user_id,out_group FROM rules WHERE id=? AND in_group=?`, it.RuleID, gid).Scan(&user, &out)
-		if errors.Is(err, sql.ErrNoRows) { // rule deleted or moved before a late report: preserve evidence instead of charging the new owner
-			if err = trafficWrite(tx, 1, `INSERT INTO traffic_unattributed(group_id,uid,stream,seq,rule_id,up,down,hour) VALUES(?,?,?,?,?,?,?,?)`, gid, uid, rep.Stream, rep.Seq, it.RuleID, it.Up, it.Down, hour); err != nil {
-				return err
-			}
-			continue
-		}
+		usedUp, err := ingestTrafficItem(tx, gid, uid, rep, it, hour)
 		if err != nil {
 			return err
 		}
-		var ratio float64
-		var hopJSON string
-		var n int
-		expected := int64(1)
-		if out != 0 && out != gid {
-			expected++
-		}
-		if err = tx.QueryRow(`SELECT COUNT(*), SUM(ratio),
-			COALESCE(MAX(CASE WHEN id=? AND type='chain' THEN json_extract(config,'$.chain_hops') END), '[]')
-			FROM device_groups WHERE id=? OR (id=? AND ?<>0)`, out, gid, out, out).Scan(&n, &ratio, &hopJSON); err != nil {
-			return err
-		}
-		charge := float64(raw) * ratio
-		if int64(n) != expected || ratio < 0 || math.IsNaN(charge) || charge >= float64(math.MaxInt64) {
-			return errors.New("invalid traffic billing groups or amount")
-		}
-		billed := int64(charge)
-		if err = trafficWrite(tx, 1, `UPDATE rules SET traffic_up=traffic_up+?,traffic_down=traffic_down+? WHERE id=? AND in_group=? AND traffic_up<=? AND traffic_down<=?`, it.Up, it.Down, it.RuleID, gid, math.MaxInt64-it.Up, math.MaxInt64-it.Down); err != nil {
-			return err
-		}
-		var used, quota int64
-		var role string
-		if err = tx.QueryRow(`UPDATE users SET traffic_used=traffic_used+? WHERE id=? AND traffic_used<=? RETURNING traffic_used,traffic_quota,role`, billed, user, math.MaxInt64-billed).Scan(&used, &quota, &role); err != nil {
-			return err
-		}
-		if role != "admin" && used >= quota && used-billed < quota {
-			crossed = true
-		}
-		if err = trafficWrite(tx, 1, `INSERT INTO traffic_hourly(user_id,hour,up,down,billed) VALUES(?,?,?,?,?) ON CONFLICT(user_id,hour) DO UPDATE SET up=up+excluded.up,down=down+excluded.down,billed=billed+excluded.billed WHERE up<=? AND down<=? AND billed<=?`, user, hour, it.Up, it.Down, billed, math.MaxInt64-it.Up, math.MaxInt64-it.Down, math.MaxInt64-billed); err != nil {
-			return err
-		}
-		if err = trafficWrite(tx, expected, `UPDATE device_groups SET traffic=traffic+? WHERE (id=? OR (id=? AND ?<>0)) AND traffic<=?`, raw, gid, out, out, math.MaxInt64-raw); err != nil {
-			return err
-		}
-		if hopJSON != "[]" {
-			var hops []int64
-			if err := json.Unmarshal([]byte(hopJSON), &hops); err != nil {
-				return err
-			}
-			for _, hop := range hops {
-				if err := trafficWrite(tx, 1, `UPDATE device_groups SET traffic=traffic+? WHERE id=? AND type='out' AND traffic<=?`, raw, hop, math.MaxInt64-raw); err != nil {
-					return err
-				}
-			}
-		}
+		crossed = crossed || usedUp
 	}
 	if err = trafficWrite(tx, 1, `INSERT INTO traffic_cursors(group_id,uid,stream,seq,digest) VALUES(?,?,?,?,?) ON CONFLICT(group_id,uid,stream) DO UPDATE SET seq=excluded.seq,digest=excluded.digest`, gid, uid, rep.Stream, rep.Seq, digest[:]); err != nil {
 		return err
@@ -134,6 +79,103 @@ func (h *Hub) ingest(gid int64, uid string, rep *proto.Report) error {
 	}
 	return nil
 }
+
+// A historical route can still be billed after the live rule is moved or removed.
+func ingestTrafficItem(tx *sql.Tx, gid int64, uid string, rep *proto.Report, it proto.Traffic, hour int64) (bool, error) {
+	unattributed := func() error {
+		return trafficWrite(tx, 1, `INSERT INTO traffic_unattributed(group_id,uid,stream,seq,rule_id,up,down,hour)
+			VALUES(?,?,?,?,?,?,?,?)`, gid, uid, rep.Stream, rep.Seq, it.RuleID, it.Up, it.Down, hour)
+	}
+	if it.RuleID <= 0 || it.Up < 0 || it.Down < 0 || it.Up > math.MaxInt64-it.Down {
+		return false, unattributed()
+	}
+	var user, out int64
+	var ratio float64
+	var hopJSON string
+	err := tx.QueryRow(`SELECT r.user_id,r.out_group,COALESCE(i.ratio,1)+COALESCE(o.ratio,0),
+		COALESCE(CASE WHEN o.type='chain' AND json_valid(o.config) THEN json_extract(o.config,'$.chain_hops') END,'[]')
+		FROM rules r LEFT JOIN device_groups i ON i.id=r.in_group
+		LEFT JOIN device_groups o ON o.id=r.out_group AND o.id<>i.id
+		WHERE r.id=? AND r.in_group=?`, it.RuleID, gid).Scan(&user, &out, &ratio, &hopJSON)
+	live := err == nil
+	if errors.Is(err, sql.ErrNoRows) {
+		err = tx.QueryRow(`SELECT user_id,out_group,ratio,hops FROM rule_billing_history
+			WHERE rule_id=? AND in_group=?`, it.RuleID, gid).Scan(&user, &out, &ratio, &hopJSON)
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, unattributed()
+	}
+	if err != nil {
+		return false, err
+	}
+	if ratio < 0 || math.IsNaN(ratio) || math.IsInf(ratio, 0) {
+		return false, unattributed()
+	}
+
+	var used, quota int64
+	var role string
+	err = tx.QueryRow(`SELECT traffic_used,traffic_quota,role FROM users WHERE id=?`, user).Scan(&used, &quota, &role)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, unattributed()
+	}
+	if err != nil {
+		return false, err
+	}
+
+	raw := it.Up + it.Down
+	charge := float64(raw) * ratio
+	billed := int64(math.MaxInt64)
+	if charge < float64(math.MaxInt64) {
+		billed = int64(charge)
+	}
+	if live {
+		if err := trafficWrite(tx, 1, `UPDATE rules SET
+			traffic_up=CASE WHEN traffic_up>? THEN ? ELSE traffic_up+? END,
+			traffic_down=CASE WHEN traffic_down>? THEN ? ELSE traffic_down+? END
+			WHERE id=? AND in_group=?`, math.MaxInt64-it.Up, math.MaxInt64, it.Up,
+			math.MaxInt64-it.Down, math.MaxInt64, it.Down, it.RuleID, gid); err != nil {
+			return false, err
+		}
+	}
+	next := used + min(billed, math.MaxInt64-max(used, 0))
+	if err := trafficWrite(tx, 1, `UPDATE users SET traffic_used=? WHERE id=?`, next, user); err != nil {
+		return false, err
+	}
+	if err := trafficWrite(tx, 1, `INSERT INTO traffic_hourly(user_id,hour,up,down,billed) VALUES(?,?,?,?,?)
+		ON CONFLICT(user_id,hour) DO UPDATE SET
+		up=CASE WHEN up>? THEN ? ELSE up+excluded.up END,
+		down=CASE WHEN down>? THEN ? ELSE down+excluded.down END,
+		billed=CASE WHEN billed>? THEN ? ELSE billed+excluded.billed END`,
+		user, hour, it.Up, it.Down, billed, math.MaxInt64-it.Up, math.MaxInt64,
+		math.MaxInt64-it.Down, math.MaxInt64, math.MaxInt64-billed, math.MaxInt64); err != nil {
+		return false, err
+	}
+	groups := map[int64]bool{gid: true}
+	if out != 0 {
+		groups[out] = true
+	}
+	var hops []int64
+	if json.Unmarshal([]byte(hopJSON), &hops) == nil {
+		for _, hop := range hops {
+			groups[hop] = true
+		}
+	}
+	for id := range groups {
+		var exists bool
+		if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM device_groups WHERE id=?)`, id).Scan(&exists); err != nil {
+			return false, err
+		}
+		if exists {
+			if err := trafficWrite(tx, 1, `UPDATE device_groups SET
+				traffic=CASE WHEN traffic>? THEN ? ELSE traffic+? END WHERE id=?`,
+				math.MaxInt64-raw, math.MaxInt64, raw, id); err != nil {
+				return false, err
+			}
+		}
+	}
+	return role != "admin" && used < quota && next >= quota, nil
+}
+
 func trafficWrite(tx *sql.Tx, want int64, stmt string, args ...any) error {
 	res, err := tx.Exec(stmt, args...)
 	if err != nil {

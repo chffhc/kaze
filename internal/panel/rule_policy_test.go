@@ -24,7 +24,7 @@ func TestRuleRevocationConfigs(t *testing.T) {
 	}
 	run(`INSERT INTO device_groups(id,name,type,token,public,config,created_at) VALUES(1,'in','in','a',1,'{}',0),(2,'primary','out','b',0,'{"failover_group":3}',0),(3,'secondary','out','c',1,'{}',0)`)
 	run(`INSERT INTO plans(id,name,groups,created_at) VALUES(1,'a','[2]',0),(2,'b','[2]',0)`)
-	run(`INSERT INTO users(id,username,password,plan_id,traffic_quota,created_at) VALUES(1,'a','',1,99,0),(2,'b','',2,99,0)`)
+	run(`INSERT INTO users(id,username,password,plan_id,traffic_quota,max_rules,created_at) VALUES(1,'a','',1,99,5,0),(2,'b','',2,99,5,0)`)
 	for i, uid := range []int{1, 2, 1} {
 		_, err := s.insertRule(db, &Rule{UserID: int64(uid), InGroup: 1, OutGroup: 2, ListenPort: 20001 + i, Proto: "tcp"})
 		if err != nil {
@@ -161,5 +161,39 @@ func TestTLSChildChainPolicy(t *testing.T) {
 	in.Config.BlockedHosts = []string{".example.org"}
 	if p.authorize(owner, &r) == nil {
 		t.Fatal("blocked child SNI still allowed")
+	}
+}
+
+func TestPlanDowngradeAndTLSParentAuthorization(t *testing.T) {
+	h, _ := trafficDB(t)
+	db := h.s.db
+	run := func(q string) {
+		t.Helper()
+		if _, err := db.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	run(`UPDATE users SET max_rules=1 WHERE id=1`)
+	run(`INSERT INTO rules(user_id,in_group,out_group,listen_port,created_at,updated_at) VALUES(1,1,2,23001,0,0)`)
+	run(`INSERT INTO users(id,username,password,role,expire_at,max_rules,created_at) VALUES(2,'parent','', 'admin',1,1,0)`)
+	run(`INSERT INTO rules(user_id,in_group,listen_port,created_at,updated_at,tls_mode) VALUES(2,1,443,0,0,'parent')`)
+	run(`INSERT INTO rules(user_id,in_group,out_group,listen_port,created_at,updated_at,tls_mode,tls_config)
+		VALUES(2,1,2,443,0,0,'child','{"sni":["a.example.com"]}')`)
+	for _, gid := range []int64{1, 2} {
+		cfg, err := h.buildConfig(gid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if gid == 1 && len(cfg.Inbound.Rules) != 3 || gid == 2 && len(cfg.Outbound.Rules) != 2 {
+			t.Fatalf("unexpected group %d config %+v", gid, cfg)
+		}
+	}
+	run(`UPDATE users SET role='user',expire_at=0,traffic_quota=999,max_rules=50 WHERE id=2`)
+	cfg, err := h.buildConfig(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Outbound.Rules) != 1 || cfg.Outbound.Rules[0].ID != 1 {
+		t.Fatalf("revoked parent's child still provisioned: %+v", cfg.Outbound.Rules)
 	}
 }

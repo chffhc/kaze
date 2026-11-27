@@ -39,15 +39,26 @@ dir=/opt/sample
 install_node sample
 test -s "$dir/.kaze-install-v1" || { echo 'missing installer ownership record' >&2; exit 1; }
 install_node sample
-touch "$dir/kaze-node.json"
+touch "$dir/kaze-node.json" "$dir/kaze-traffic-v2.outbox" "$dir/kaze-traffic-v2.outbox.tmp"
 uninstall_node sample
 test ! -e "$dir" && test ! -e "$unit" || exit 1
 : >/tmp/changes; uninstall_node sample; test ! -s /tmp/changes
 echo 'PASS install, reinstall, clean and repeat uninstall'
+install_node upgrade
+rm /opt/upgrade/.kaze-install-v1
+printf 'cached state\n' >/opt/upgrade/kaze-node.json
+bash /installer -n upgrade -u https://test.invalid -t rotated --rev-port 21555 >/dev/null
+grep -Fxq 'cached state' /opt/upgrade/kaze-node.json
+test -s /opt/upgrade/.kaze-install-v1
+uninstall_node upgrade
+echo 'PASS stock legacy service upgrade preserves node state'
 install_node sample
 mkdir "$dir/notes"; touch "$dir/notes/keep" /opt/neighbor
 uninstall_node sample
 test -f "$dir/notes/keep" && test -f /opt/neighbor && test ! -e "$unit" && test ! -e "$dir/env" || exit 1
+install_node sample
+test -f "$dir/notes/keep"
+uninstall_node sample
 echo 'PASS unknown contents and neighboring files preserved'
 reject uninstall_node ''; reject uninstall_node '-bad'; reject install_node '..'
 echo 'PASS invalid names rejected before mutations'

@@ -154,3 +154,57 @@ func TestChainTrafficReplay(t *testing.T) {
 		t.Fatalf("%d groups counted once, want 4", n)
 	}
 }
+
+func TestTrafficBillsHistoryAfterMoveAndDelete(t *testing.T) {
+	h, _ := trafficDB(t)
+	db := h.s.db
+	for _, sql := range []string{
+		`INSERT INTO device_groups(id,name,type,token,ratio,created_at) VALUES(3,'other','in','c',4,0)`,
+		`UPDATE rules SET in_group=3 WHERE id=1`,
+		`DELETE FROM rules WHERE id=1`,
+		`DELETE FROM device_groups WHERE id=2`,
+	} {
+		if _, err := db.Exec(sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, gid := range []int64{1, 3, 1, 3} {
+		if err := h.ingest(gid, "node", fixtureReport(1)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := scalar[int](t, db, `SELECT traffic_used FROM users`); got != 162 {
+		t.Fatalf("billed %d, want 162", got)
+	}
+}
+
+func TestTrafficBatchProgressWithMissingHopAndSaturation(t *testing.T) {
+	h, _ := trafficDB(t)
+	db := h.s.db
+	_, err := db.Exec(`INSERT INTO device_groups(id,name,type,token,ratio,config,created_at)
+		VALUES(3,'chain','chain','c',2,'{"chain_hops":[2,99]}',0);
+		UPDATE rules SET out_group=3;
+		UPDATE users SET traffic_used=9223372036854775806`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := fixtureReport(1)
+	r.Items = append([]proto.Traffic{{RuleID: 0, Up: 1}}, r.Items...)
+	for range 2 {
+		if err := h.ingest(1, "node", r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := scalar[int64](t, db, `SELECT traffic_used FROM users`); got != 9223372036854775807 {
+		t.Fatal(got)
+	}
+	if n := scalar[int](t, db, `SELECT count(*) FROM device_groups WHERE traffic=18`); n != 3 {
+		t.Fatal(n)
+	}
+	if n := scalar[int](t, db, `SELECT count(*) FROM traffic_unattributed`); n != 1 {
+		t.Fatal(n)
+	}
+	if err := h.ingest(1, "node", fixtureReport(2)); err != nil {
+		t.Fatal(err)
+	}
+}

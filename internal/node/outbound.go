@@ -62,23 +62,23 @@ func (o *outbound) apply(cfg *proto.OutboundConfig, groupID int64) error {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
+	privateRevoked := o.dialer.Load().AllowPrivate && !cfg.AllowPrivate
+	if d := o.dialer.Load(); d.AllowPrivate != cfg.AllowPrivate {
+		o.dialer.Store(relay.NewDialer(cfg.AllowPrivate))
+	}
+	tunnelChanges := o.tunnels.apply(cfg.Tunnels, tunnel.ClientOpts{
+		MaxFail: cfg.MaxFail, FailTimeout: time.Duration(cfg.FailTimeout) * time.Second, Now: o.a.now,
+	})
+
 	// 规则表:内容没变的规则沿用原对象,保留均衡器里的健康状态。
 	old := *o.rules.Load()
 	next := make(map[int64]*outRule, len(cfg.Rules))
 	for _, r := range cfg.Rules {
-		if prev := old[r.ID]; prev != nil && reflect.DeepEqual(prev.spec, r) {
+		if prev := old[r.ID]; prev != nil && !privateRevoked && !tunnelChanges[r.Next] && reflect.DeepEqual(prev.spec, r) {
 			next[r.ID] = prev
 			continue
 		}
-		// Existing sessions keep their original targets on edits. Only a
-		// removal ends this ID's lifetime (including sessions predating edits).
-		var live *ruleConns
-		if prev := old[r.ID]; prev != nil {
-			live = prev.live
-		} else {
-			live = newRuleConns()
-		}
-		or := &outRule{spec: r, live: live}
+		or := &outRule{spec: r, live: newRuleConns()}
 		if r.Next == 0 {
 			or.bal = relay.NewBalancer(r.Targets, r.LB, cfg.MaxFail, time.Duration(cfg.FailTimeout)*time.Second)
 		}
@@ -86,16 +86,10 @@ func (o *outbound) apply(cfg *proto.OutboundConfig, groupID int64) error {
 	}
 	o.rules.Store(&next)
 	for id, prev := range old {
-		if next[id] == nil {
+		if next[id] != prev {
 			prev.live.stop()
 		}
 	}
-	if d := o.dialer.Load(); d.AllowPrivate != cfg.AllowPrivate {
-		o.dialer.Store(relay.NewDialer(cfg.AllowPrivate))
-	}
-	o.tunnels.apply(cfg.Tunnels, tunnel.ClientOpts{
-		MaxFail: cfg.MaxFail, FailTimeout: time.Duration(cfg.FailTimeout) * time.Second, Now: o.a.now,
-	})
 
 	keys, err := tunnel.DeriveKeys(cfg.Key)
 	if err != nil {

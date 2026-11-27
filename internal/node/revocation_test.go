@@ -38,10 +38,12 @@ func TestActiveRuleRevocation(t *testing.T) {
 	for _, tc := range []struct {
 		name                                 string
 		exit, tunnelled, streamUDP, fallback bool
+		editTarget                           bool
 	}{
 		{name: "direct"},
 		{name: "entry-native", tunnelled: true},
 		{name: "exit-native", exit: true, tunnelled: true},
+		{name: "exit-target-edit", exit: true, tunnelled: true, editTarget: true},
 		{name: "exit-fallback-native", exit: true, tunnelled: true, fallback: true},
 		{name: "entry-fallback-stream", tunnelled: true, streamUDP: true, fallback: true},
 		{name: "exit-fallback-stream", exit: true, tunnelled: true, streamUDP: true, fallback: true},
@@ -88,7 +90,14 @@ func TestActiveRuleRevocation(t *testing.T) {
 				exchange(t, udp[i], 'B')
 				original[i] = <-peers
 			}
-			if tc.exit {
+			var newPeers chan netip.AddrPort
+			if tc.editTarget {
+				newPeers = make(chan netip.AddrPort, 1)
+				oc.Rules[0].Targets = []string{echoServerWithUDPPeer(t, newPeers)}
+				if err := exit.out.apply(&oc, 1); err != nil {
+					t.Fatal(err)
+				}
+			} else if tc.exit {
 				oc.Rules = oc.Rules[1:]
 				if err := exit.out.apply(&oc, 1); err != nil {
 					t.Fatal(err)
@@ -104,10 +113,30 @@ func TestActiveRuleRevocation(t *testing.T) {
 			if ne, ok := err.(net.Error); err == nil || ok && ne.Timeout() {
 				t.Fatalf("revoked TCP still open: %v", err)
 			}
-			udp[0].SetDeadline(time.Now().Add(150 * time.Millisecond))
-			if _, err := udp[0].Write([]byte{'X'}); err == nil {
-				if _, err = udp[0].Read(buf[:]); err == nil {
-					t.Fatal("revoked UDP session replied")
+			if tc.editTarget {
+				exchange(t, udp[0], 'X')
+				select {
+				case <-newPeers:
+				case <-time.After(time.Second):
+					t.Fatal("datagram did not reach the new target")
+				}
+			} else {
+				udp[0].SetDeadline(time.Now().Add(150 * time.Millisecond))
+				if _, err := udp[0].Write([]byte{'X'}); err == nil {
+					if _, err = udp[0].Read(buf[:]); err == nil {
+						t.Fatal("revoked UDP session replied")
+					}
+				}
+			}
+			if !tc.exit {
+				var retired proto.Traffic
+				for _, item := range entry.in.collect() {
+					if item.RuleID == 1 {
+						retired = item
+					}
+				}
+				if retired.Up < 2 || retired.Down < 2 {
+					t.Fatalf("missing TCP or UDP bytes for retired rule: %+v", retired)
 				}
 			}
 			exchange(t, tcp[1], 'C')

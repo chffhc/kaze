@@ -67,6 +67,9 @@ func (p *rulePolicy) authorize(owner *User, r *Rule) error {
 		}
 	}
 	if r.TLSMode == proto.TLSModeParent {
+		if !owner.IsAdmin() {
+			return errors.New("共享 TLS 端口仅限管理员持有")
+		}
 		return nil
 	}
 	if ig.Config.DisableUDP {
@@ -96,3 +99,33 @@ func (p *rulePolicy) authorize(owner *User, r *Rule) error {
 	}
 	return nil
 }
+
+const ruleWithinQuotaSQL = `(u.role='admin' OR (SELECT COUNT(*) FROM rules earlier
+	WHERE earlier.user_id=r.user_id AND earlier.id<=r.id)<=u.max_rules)`
+
+type tlsParentState struct {
+	id     int64
+	usable bool
+}
+
+func (p *rulePolicy) tlsParents(q dbq) (map[[2]int64]tlsParentState, error) {
+	rows, err := q.Query(`SELECT `+ruleCols+`,u.role,u.plan_id,(CASE WHEN `+activeUserSQL+` THEN 1 ELSE 0 END)
+		FROM rules r JOIN users u ON u.id=r.user_id WHERE r.tls_mode='parent'`, now())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make(map[[2]int64]tlsParentState)
+	for rows.Next() {
+		var owner User
+		var active bool
+		r, err := scanRule(rows, &owner.Role, &owner.PlanID, &active)
+		if err != nil {
+			return nil, err
+		}
+		result[r.parentKey()] = tlsParentState{id: r.ID, usable: active && !r.Paused && p.authorize(&owner, r) == nil}
+	}
+	return result, rows.Err()
+}
+
+func (r *Rule) parentKey() [2]int64 { return [2]int64{r.InGroup, int64(r.ListenPort)} }

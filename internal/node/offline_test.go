@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 	"time"
 
@@ -83,4 +84,40 @@ func TestPanelDisconnectKeepsLastSnapshot(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	exchange(t, dialLocal(t, "udp", addr), 'f')
+}
+
+func TestPanelUnauthorizedRevokesSnapshot(t *testing.T) {
+	panel := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer panel.Close()
+	a := newTestAgent(t)
+	a.opt.PanelURL, a.opt.Token = panel.URL, "old"
+	r := proto.Rule{ID: 1, ListenPort: freePort(t), Proto: "tcp", Targets: []string{echoServer(t)}}
+	if err := a.applyConfig(&proto.NodeConfig{Role: proto.RoleIn, Inbound: &proto.InboundConfig{
+		AllowPrivate: true, Rules: []proto.Rule{r},
+	}}, true); err != nil {
+		t.Fatal(err)
+	}
+	addr := fmt.Sprintf("127.0.0.1:%d", r.ListenPort)
+	conn := dialLocal(t, "tcp", addr)
+	exchange(t, conn, 'a')
+	if err := a.session(t.Context()); err == nil {
+		t.Fatal("expected authentication rejection")
+	}
+	conn.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := conn.Read(make([]byte, 1)); err == nil || os.IsTimeout(err) {
+		t.Fatalf("old connection remains open: %v", err)
+	}
+	if c, err := net.DialTimeout("tcp", addr, time.Second); err == nil {
+		c.Close()
+		t.Fatal("listener remains open")
+	}
+	reloaded := &Agent{opt: a.opt}
+	if err := reloaded.loadState(); err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.state.LastConfig != nil {
+		t.Fatal("revoked configuration still on disk")
+	}
 }

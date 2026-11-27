@@ -266,7 +266,7 @@ func TestLostACKRestart(t *testing.T) {
 	tx, err := db.Begin()
 	check(t, err)
 	defer tx.Rollback()
-	_, err = tx.Exec(`INSERT INTO users(id,username,password,traffic_quota,created_at) VALUES(41,'fixture','not-a-password-hash',1000000,0)`)
+	_, err = tx.Exec(`INSERT INTO users(id,username,password,traffic_quota,max_rules,created_at) VALUES(41,'fixture','not-a-password-hash',1000000,1,0)`)
 	check(t, err)
 	_, err = tx.Exec(`INSERT INTO device_groups(id,name,type,token,ratio,config,created_at) VALUES(42,'fixture','in',?,2,'{"allow_private":true,"port_range":"1024-65535"}',0)`, token)
 	check(t, err)

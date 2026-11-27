@@ -56,6 +56,16 @@ func seedRecharge(t *testing.T, s *Server) {
 	shopExec(t, s, `INSERT INTO orders(order_no,user_id,type,amount,created_at) VALUES('fixture',1,'recharge',125,0)`)
 }
 func TestRechargeAtomic(t *testing.T) {
+	t.Run("cancelled", func(t *testing.T) {
+		s := shopFixture(t)
+		seedRecharge(t, s)
+		shopExec(t, s, "UPDATE orders SET status='cancelled'")
+		if w := notifyFixture(s); w.Code != 409 {
+			t.Fatalf("cancelled recharge returned status %d", w.Code)
+		}
+		shopAssertInt(t, s, "SELECT COUNT(*) FROM orders WHERE status='cancelled' AND paid_at=0", 1)
+		shopAssertInt(t, s, "SELECT balance FROM users WHERE id=1", 17)
+	})
 	for _, tc := range []struct{ name, event, action string }{{"order_error", "UPDATE OF status ON orders", "ABORT,'fixture'"}, {"credit_error", "UPDATE OF balance ON users", "ABORT,'fixture'"}, {"credit_zero_rows", "UPDATE OF balance ON users", "IGNORE"}, {"order_zero_rows", "UPDATE OF status ON orders", "IGNORE"}} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := shopFixture(t)
@@ -93,6 +103,26 @@ func TestRechargeAtomic(t *testing.T) {
 		shopAssertInt(t, s, `SELECT balance FROM users WHERE id=1`, 142)
 		shopAssertInt(t, s, `SELECT COUNT(*) FROM orders WHERE status='paid' AND trade_no='receipt' AND paid_at>0`, 1)
 	})
+}
+func TestPurchaseRequiresDebitAndOrder(t *testing.T) {
+	for _, event := range []string{"UPDATE OF balance ON users", "INSERT ON orders"} {
+		t.Run(event, func(t *testing.T) {
+			s := shopFixture(t)
+			shopExec(t, s, "INSERT INTO plans(id,name,price,created_at) VALUES(3,'fixture',5,0)")
+			shopFault(t, s, event, "IGNORE")
+			if err := s.purchase(1, 3, "plan"); err == nil {
+				t.Fatal("purchase succeeded with a missing ledger write")
+			}
+			shopAssertInt(t, s, "SELECT COUNT(*) FROM users WHERE balance=17 AND plan_id=0", 1)
+			shopAssertInt(t, s, "SELECT COUNT(*) FROM orders", 0)
+			shopExec(t, s, "DROP TRIGGER fixture_fault")
+			if err := s.purchase(1, 3, "plan"); err != nil {
+				t.Fatal(err)
+			}
+			shopAssertInt(t, s, "SELECT COUNT(*) FROM users WHERE balance=12 AND plan_id=3", 1)
+			shopAssertInt(t, s, "SELECT COUNT(*) FROM orders WHERE status='paid' AND amount=5", 1)
+		})
+	}
 }
 func redeemFixture(s *Server) *httptest.ResponseRecorder {
 	w := httptest.NewRecorder()

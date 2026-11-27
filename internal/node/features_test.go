@@ -638,6 +638,11 @@ func TestTLSInboundSNISplit(t *testing.T) {
 	}
 
 	// 热更新:删掉子规则 12 不影响子规则 11 上已有的连接
+	renewedCert, renewedKey, _, renewedPool := testCert(t, "*.cdn.example.com")
+	renewedTLS := *parent.TLS
+	renewedTLS.CertPEM, renewedTLS.KeyPEM = renewedCert, renewedKey
+	parent.TLS = &renewedTLS
+	wildPool = renewedPool
 	cfg.Rules = []proto.Rule{parent, c1, c3}
 	apply()
 	hold.Write([]byte("still-here\n"))

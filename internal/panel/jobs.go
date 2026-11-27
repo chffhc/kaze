@@ -61,6 +61,7 @@ func (s *Server) autoRenew(t int64) {
 
 func (s *Server) cleanup() {
 	t := now()
+	s.db.Exec(`DELETE FROM traffic_unattributed WHERE hour<?`, t-62*86400)
 	s.db.Exec(`DELETE FROM traffic_hourly WHERE hour<?`, t-62*86400)
 	s.db.Exec(`UPDATE orders SET status='cancelled' WHERE status='pending' AND created_at<?`, t-86400)
 }

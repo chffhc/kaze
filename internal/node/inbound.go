@@ -77,11 +77,12 @@ func (in *inbound) apply(cfg *proto.InboundConfig) {
 }
 
 func (in *inbound) applyLocked(cfg *proto.InboundConfig) {
+	previous := in.last
 	in.last = cfg
 
 	// 1. 反向隧道监听,以及到各出口组的隧道客户端
 	in.applyReverseLocked(cfg.Reverse)
-	in.tunnels.apply(cfg.Tunnels, tunnel.ClientOpts{
+	tunnelChanges := in.tunnels.apply(cfg.Tunnels, tunnel.ClientOpts{
 		MaxFail: cfg.MaxFail, FailTimeout: time.Duration(cfg.FailTimeout) * time.Second, Now: in.a.now, Reverse: in.rev,
 	})
 
@@ -98,6 +99,9 @@ func (in *inbound) applyLocked(cfg *proto.InboundConfig) {
 	}
 
 	// 3. 全局策略
+	policyChanged := previous != nil && (previous.AllowPrivate && !cfg.AllowPrivate ||
+		!slices.Equal(previous.BlockedProtocols, cfg.BlockedProtocols) || !slices.Equal(previous.BlockedHosts, cfg.BlockedHosts) ||
+		!slices.Equal(previous.AllowedHosts, cfg.AllowedHosts) || !previous.TLSRejectEmptySNI && cfg.TLSRejectEmptySNI)
 	in.policy.Store(relay.NewSniffPolicy(cfg.BlockedProtocols, cfg.BlockedHosts, cfg.AllowedHosts))
 	in.rejectEmptySNI.Store(cfg.TLSRejectEmptySNI)
 	if d := in.dialer.Load(); d.AllowPrivate != cfg.AllowPrivate {
@@ -106,8 +110,8 @@ func (in *inbound) applyLocked(cfg *proto.InboundConfig) {
 
 	// 4. 规则
 	want := make(map[int64]*proto.Rule, len(cfg.Rules))
-	for i := range cfg.Rules {
-		r := &cfg.Rules[i]
+	for _, spec := range cfg.Rules {
+		r := &spec
 		if r.TLS != nil {
 			r.Proto = "tcp" // TLS 入站只有 TCP
 		} else if cfg.DisableUDP {
@@ -126,7 +130,7 @@ func (in *inbound) applyLocked(cfg *proto.InboundConfig) {
 				ul = ue.lim
 			}
 		}
-		if w == nil || !reflect.DeepEqual(run.spec, *w) || run.ulim != ul {
+		if w == nil || policyChanged || tunnelChanges[run.spec.OutGroup] || run.ulim != ul || !run.updateParentCertificate(*w) {
 			in.stopLocked(id, run)
 		}
 	}
@@ -349,11 +353,13 @@ func (in *inbound) diag(ruleID int64) []proto.DiagHop {
 // ---- 单条规则 ----
 
 type ruleRunner struct {
-	in   *inbound
-	spec proto.Rule
-	ulim *relay.Limits // 用户级
-	rlim *relay.Limits // 规则级
-	bal  *relay.Balancer
+	configured proto.Rule // guarded by in.mu
+	udpDone    chan struct{}
+	in         *inbound
+	spec       proto.Rule
+	ulim       *relay.Limits // 用户级
+	rlim       *relay.Limits // 规则级
+	bal        *relay.Balancer
 
 	up, down atomic.Int64
 
@@ -421,7 +427,7 @@ func (r *ruleRunner) loadTLS() error {
 
 func (in *inbound) startRule(spec proto.Rule, ulim *relay.Limits, cfg *proto.InboundConfig) (*ruleRunner, error) {
 	r := &ruleRunner{
-		in: in, spec: spec, ulim: ulim, live: newRuleConns(),
+		in: in, spec: spec, configured: spec, ulim: ulim, live: newRuleConns(),
 		rlim: relay.NewLimits(spec.SpeedLimit, spec.ConnLimit, spec.IPLimit),
 	}
 	mode := r.tlsMode()
@@ -481,12 +487,40 @@ func (in *inbound) startRule(spec proto.Rule, ulim *relay.Limits, cfg *proto.Inb
 		}
 	}
 	if r.udp != nil {
-		go r.udp.Serve()
+		r.udpDone = make(chan struct{})
+		go func() { defer close(r.udpDone); r.udp.Serve() }()
 	}
 	if r.tcpLn != nil {
 		go r.serveTCP()
 	}
 	return r, nil
+}
+
+// A certificate-only renewal changes future handshakes, not established child streams.
+func (r *ruleRunner) updateParentCertificate(next proto.Rule) bool {
+	current := r.configured
+	if reflect.DeepEqual(current, next) {
+		return true
+	}
+	if r.tlsMode() != proto.TLSModeParent || next.TLS == nil || next.TLS.Mode != proto.TLSModeParent {
+		return false
+	}
+	currentTLS, nextTLS := *current.TLS, *next.TLS
+	currentTLS.CertPEM, currentTLS.KeyPEM = "", ""
+	nextTLS.CertPEM, nextTLS.KeyPEM = "", ""
+	current.TLS = &currentTLS
+	config := next
+	config.TLS = &nextTLS
+	if !reflect.DeepEqual(current, config) {
+		return false
+	}
+	replacement := ruleRunner{spec: next}
+	if err := replacement.loadTLS(); err != nil {
+		return false
+	}
+	r.cert, r.ownCert = replacement.cert, replacement.ownCert
+	r.configured = next
+	return true
 }
 
 func (r *ruleRunner) stop() {
@@ -496,7 +530,10 @@ func (r *ruleRunner) stop() {
 	}
 	if r.udp != nil {
 		r.udp.Close()
+		<-r.udpDone
+		r.udp.Wait()
 	}
+	r.live.workers.Wait()
 }
 
 func (r *ruleRunner) serveTCP() {
@@ -597,10 +634,10 @@ func (r *ruleRunner) serve(c net.Conn, src netip.AddrPort, sniff bool, alpn stri
 	}
 	defer relay.ReleaseAll(src.Addr(), r.rlim, r.ulim)
 
-	if !r.live.track(c) {
+	if !r.live.start(c) {
 		return
 	}
-	defer r.live.forget(c)
+	defer r.live.finish(c)
 
 	var prefix []byte
 	if sniff {
@@ -649,7 +686,8 @@ func (r *ruleRunner) serve(c net.Conn, src netip.AddrPort, sniff bool, alpn stri
 	}
 	defer r.live.forget(target)
 	relay.Pipe(c, target, &relay.PipeOpts{
-		Up: &r.up, Down: &r.down,
+		Context: r.live.ctx,
+		Up:      &r.up, Down: &r.down,
 		UpLimits:   [2]*relay.Bucket{bucketUp(r.rlim), bucketUp(r.ulim)},
 		DownLimits: [2]*relay.Bucket{bucketDown(r.rlim), bucketDown(r.ulim)},
 		Prefix:     prefix,

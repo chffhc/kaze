@@ -34,7 +34,8 @@ var udpSessPool = sync.Pool{New: func() any { b := make([]byte, udpSessBuf+64); 
 // UDPRelay 是一个全锥形 NAT 式的 UDP 转发器:按来源地址建立会话,每个会话一个上游。
 // 入口规则与出口的原生 UDP 通道共用这套实现,区别只在 Decode / Encode / Open。
 type UDPRelay struct {
-	Conn *net.UDPConn
+	workers sync.WaitGroup
+	Conn    *net.UDPConn
 	// Open 为新会话建立上游;在会话自己的协程里调用,可以阻塞(DNS、隧道握手)。
 	Open func(client netip.AddrPort, tag uint32) (Upstream, error)
 	// Decode 解析收到的报文(出口用于解密并取出规则号);为 nil 表示原样转发。
@@ -157,6 +158,7 @@ func (r *UDPRelay) newSession(key udpSessionKey) *udpSession {
 	s.last.Store(time.Now().UnixNano())
 	r.sessions[key] = s
 	ActiveUDP.Add(1)
+	r.workers.Add(1)
 	go s.run()
 	return s
 }
@@ -181,6 +183,7 @@ func (s *udpSession) stop() {
 
 func (s *udpSession) run() {
 	r := s.r
+	defer r.workers.Done()
 	defer func() {
 		r.mu.Lock()
 		if r.sessions[s.udpSessionKey] == s {
@@ -203,8 +206,9 @@ func (s *udpSession) run() {
 		s.up = up
 	}
 	s.mu.Unlock()
-	defer s.stop()
-	go s.recvLoop(up)
+	recvDone := make(chan struct{})
+	go func() { defer close(recvDone); s.recvLoop(up) }()
+	defer func() { s.stop(); <-recvDone }()
 	for {
 		select {
 		case pb := <-s.q:
@@ -278,6 +282,9 @@ func (r *UDPRelay) Close() {
 	}
 	r.mu.Unlock()
 }
+
+// Wait waits for all sessions after Close.
+func (r *UDPRelay) Wait() { r.workers.Wait() }
 
 // ---- 上游实现 ----
 

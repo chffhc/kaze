@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"os"
 	"path/filepath"
@@ -32,6 +33,8 @@ const (
 // sequence even when Pending is empty. A successor has no sequence until promoted.
 type trafficState struct {
 	Version int             `json:"version"`
+	Scope   string          `json:"scope,omitempty"`
+	GroupID int64           `json:"group_id,omitempty"`
 	Owner   string          `json:"owner"`
 	Stream  string          `json:"stream"`
 	Seq     int64           `json:"seq"`
@@ -40,19 +43,21 @@ type trafficState struct {
 }
 
 type trafficBox struct {
-	mu     sync.Mutex
-	path   string
-	dir    *os.File // exclusive lock on the stable directory inode, NOT the renamed file
-	state  trafficState
-	staged *trafficState // sole possible next state; retained even after an ambiguous rename
-	write  func(string, []byte) error
+	rebound       bool
+	awaitingGroup bool
+	mu            sync.Mutex
+	path          string
+	dir           *os.File // exclusive lock on the stable directory inode, NOT the renamed file
+	state         trafficState
+	staged        *trafficState // sole possible next state; retained even after an ambiguous rename
+	write         func(string, []byte) error
 }
 
 func openTrafficDir(path string) (*os.File, error) {
 	if err := os.MkdirAll(path, 0700); err != nil {
 		return nil, err
 	}
-	d, err := os.Open(path)
+	d, err := openTrafficLock(path)
 	if err != nil {
 		return nil, err
 	}
@@ -76,16 +81,29 @@ func openTraffic(opt Options, uid string) (*trafficBox, error) {
 	return b, err
 }
 
+func trafficScope(opt Options, uid string) string {
+	identity, _ := json.Marshal([2]string{strings.TrimRight(opt.PanelURL, "/"), uid})
+	return fmt.Sprintf("%x", sha256.Sum256(identity))
+}
+
+func trafficOwner(opt Options, uid string) string {
+	identity, _ := json.Marshal([3]string{strings.TrimRight(opt.PanelURL, "/"), uid, opt.Token})
+	return fmt.Sprintf("%x", sha256.Sum256(identity))
+}
+
+func (b *trafficBox) reset(owner string) error {
+	var id [16]byte
+	rand.Read(id[:])
+	b.staged = &trafficState{Version: 2, Owner: owner, Stream: hex.EncodeToString(id[:])}
+	return b.flush()
+}
+
 func loadTraffic(opt Options, uid string, d *os.File) (*trafficBox, error) {
 	b := &trafficBox{path: filepath.Join(opt.StateDir, trafficName), dir: d, write: writeTrafficAtomic}
-	identity, _ := json.Marshal([3]string{strings.TrimRight(opt.PanelURL, "/"), uid, opt.Token})
-	owner := fmt.Sprintf("%x", sha256.Sum256(identity))
+	owner := trafficOwner(opt, uid)
 	info, err := os.Lstat(b.path)
 	if errors.Is(err, os.ErrNotExist) {
-		var id [16]byte
-		rand.Read(id[:])
-		b.staged = &trafficState{Version: 2, Owner: owner, Stream: hex.EncodeToString(id[:])}
-		if err := b.flush(); err != nil {
+		if err := b.reset(owner); err != nil {
 			return nil, err
 		}
 		return b, nil
@@ -100,8 +118,8 @@ func loadTraffic(opt Options, uid string, d *os.File) (*trafficBox, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
 	data, err := io.ReadAll(io.LimitReader(f, trafficMaxFile+1))
+	f.Close()
 	if err != nil {
 		return nil, err
 	}
@@ -113,9 +131,6 @@ func loadTraffic(opt Options, uid string, d *os.File) (*trafficBox, error) {
 		return nil, err
 	}
 	s := b.state
-	if s.Owner != owner {
-		return nil, errors.New("traffic outbox belongs to another panel, node UID or token")
-	}
 	id, err := hex.DecodeString(s.Stream)
 	if err != nil || len(id) != 16 || hex.EncodeToString(id) != s.Stream || s.Version != 2 || s.Seq < 0 || (len(s.Pending) > 0 && s.Seq == 0) || (len(s.Pending) == 0 && len(s.Buffer) > 0) {
 		return nil, errors.New("invalid traffic stream state")
@@ -132,11 +147,69 @@ func loadTraffic(opt Options, uid string, d *os.File) (*trafficBox, error) {
 			prev = v.RuleID
 		}
 	}
+	if s.Owner != owner {
+		b.rebound = true
+		if s.Scope == trafficScope(opt, uid) && s.GroupID > 0 {
+			// Wait for an authenticated configuration to confirm group identity.
+			b.awaitingGroup = true
+		} else {
+			if err := b.archive(); err != nil {
+				return nil, err
+			}
+			if err := b.reset(owner); err != nil {
+				return nil, err
+			}
+		}
+	}
 	// A previous process might have exited after rename but before directory fsync.
-	if err = d.Sync(); err != nil {
+	if err = syncTrafficDir(opt.StateDir); err != nil {
 		return nil, err
 	}
 	return b, nil
+}
+
+func (b *trafficBox) archive() error {
+	if len(b.state.Pending) == 0 && len(b.state.Buffer) == 0 {
+		return nil
+	}
+	body, err := json.Marshal(&b.state)
+	if err != nil {
+		return err
+	}
+	data := append([]byte(fmt.Sprintf("%x\n", sha256.Sum256(body))), body...)
+	archive := b.path + "." + b.state.Stream + ".bak"
+	if err := writeTrafficAtomic(archive, data); err != nil {
+		return fmt.Errorf("archive traffic for previous credentials: %w", err)
+	}
+	log.Printf("unconfirmed traffic for previous credentials preserved in %s", archive)
+	return nil
+}
+
+func (b *trafficBox) bindGroup(opt Options, uid string, groupID int64) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if err := b.flush(); err != nil {
+		return err
+	}
+	owner, scope := trafficOwner(opt, uid), trafficScope(opt, uid)
+	if b.state.GroupID != 0 && b.state.GroupID != groupID {
+		if err := b.archive(); err != nil {
+			return err
+		}
+		if err := b.reset(owner); err != nil {
+			return err
+		}
+	}
+	s := b.state
+	if s.Owner != owner || s.Scope != scope || s.GroupID != groupID {
+		s.Owner, s.Scope, s.GroupID = owner, scope, groupID
+		b.staged = &s
+		if err := b.flush(); err != nil {
+			return err
+		}
+	}
+	b.awaitingGroup = false
+	return nil
 }
 
 func validTraffic(v proto.Traffic) bool {
@@ -165,15 +238,10 @@ func writeTrafficAtomic(path string, data []byte) error {
 	if cerr != nil {
 		return cerr
 	}
-	if err = os.Rename(tmp, path); err != nil {
+	if err = replaceTrafficFile(tmp, path); err != nil {
 		return err
 	}
-	d, err := os.Open(filepath.Dir(path))
-	if err != nil {
-		return err
-	}
-	defer d.Close()
-	return d.Sync()
+	return syncTrafficDir(filepath.Dir(path))
 }
 
 // flush only publishes after all durability barriers, never substituting a
@@ -201,6 +269,9 @@ func (b *trafficBox) flush() error {
 func (b *trafficBox) checkpoint(in *inbound) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.awaitingGroup {
+		return nil
+	}
 	if err := b.flush(); err != nil {
 		return err
 	}
@@ -257,7 +328,7 @@ func (b *trafficBox) checkpoint(in *inbound) error {
 func (b *trafficBox) report() *proto.Report {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.staged != nil || len(b.state.Pending) == 0 {
+	if b.awaitingGroup || b.staged != nil || len(b.state.Pending) == 0 {
 		return nil
 	}
 	return &proto.Report{Stream: b.state.Stream, Seq: b.state.Seq, Items: b.state.Pending}

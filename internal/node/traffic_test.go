@@ -134,13 +134,6 @@ func TestTrafficFailClosed(t *testing.T) {
 			t.Fatal("unexpectedly accepted state")
 		}
 	}
-	check(opt, "other")
-	changed := opt
-	changed.Token = "other"
-	check(changed, "n")
-	changed = opt
-	changed.PanelURL = "other"
-	check(changed, "n")
 	raw, err := os.ReadFile(b.path)
 	if err != nil {
 		t.Fatal(err)
@@ -153,5 +146,72 @@ func TestTrafficFailClosed(t *testing.T) {
 	got, _ := os.ReadFile(b.path)
 	if !bytes.Equal(got, raw) {
 		t.Fatal("overwrote corrupt file")
+	}
+}
+
+func TestTrafficRebindPreservesOldBatch(t *testing.T) {
+	opt := Options{StateDir: t.TempDir(), PanelURL: "https://fixture.invalid", Token: "old"}
+	b, err := openTraffic(opt, "node")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.staged = &trafficState{Version: 2, Owner: b.state.Owner, Stream: b.state.Stream, Seq: 1,
+		Pending: []proto.Traffic{{RuleID: 1, Up: 10}}}
+	if err := b.flush(); err != nil {
+		t.Fatal(err)
+	}
+	stream := b.state.Stream
+	raw, err := os.ReadFile(b.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.close()
+	opt.Token = "new"
+	b, err = openTraffic(opt, "node")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.close()
+	if b.report() != nil || b.state.Stream == stream || !b.rebound {
+		t.Fatal("old report was carried over")
+	}
+	archive, err := os.ReadFile(b.path + "." + stream + ".bak")
+	if err != nil || !bytes.Equal(raw, archive) {
+		t.Fatalf("old report not preserved: %v", err)
+	}
+}
+
+func TestTrafficTokenRotationKeepsSameGroupBatch(t *testing.T) {
+	opt := Options{StateDir: t.TempDir(), PanelURL: "https://fixture.invalid", Token: "old"}
+	b, err := openTraffic(opt, "node")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.bindGroup(opt, "node", 9); err != nil {
+		t.Fatal(err)
+	}
+	next := b.state
+	next.Seq = 1
+	next.Pending = []proto.Traffic{{RuleID: 1, Up: 10}}
+	b.staged = &next
+	if err := b.flush(); err != nil {
+		t.Fatal(err)
+	}
+	b.close()
+	opt.Token = "fresh"
+	b, err = openTraffic(opt, "node")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.close()
+	if b.report() != nil {
+		t.Fatal("reported before group was authenticated")
+	}
+	if err := b.bindGroup(opt, "node", 9); err != nil {
+		t.Fatal(err)
+	}
+	report := b.report()
+	if report == nil || report.Stream != next.Stream || report.Seq != next.Seq {
+		t.Fatal("same group batch was not preserved")
 	}
 }

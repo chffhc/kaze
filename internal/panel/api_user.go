@@ -681,27 +681,13 @@ func (s *Server) handleRuleList(w http.ResponseWriter, r *http.Request, u *User)
 		s.dbErr(w, err)
 		return
 	}
-	// 母规则的状态决定挂在它下面的子规则能不能用
-	type parentState struct {
-		id     int64
-		usable bool
-	}
-	parents := map[[2]int64]parentState{}
-	prow, err := s.db.Query(`SELECT r.id, r.in_group, r.listen_port, (CASE WHEN r.paused=0 AND `+activeUserSQL+` THEN 1 ELSE 0 END)
-		FROM rules r JOIN users u ON u.id=r.user_id WHERE r.tls_mode='parent'`, now())
+	parents, err := policy.tlsParents(s.db)
 	if err != nil {
 		s.dbErr(w, err)
 		return
 	}
-	for prow.Next() {
-		var p parentState
-		var gid, port int64
-		prow.Scan(&p.id, &gid, &port, &p.usable)
-		parents[[2]int64{gid, port}] = p
-	}
-	prow.Close()
 
-	q := `SELECT ` + ruleCols + `, u.username,u.role,u.plan_id, (CASE WHEN ` + activeUserSQL + ` THEN 1 ELSE 0 END) FROM rules r JOIN users u ON u.id=r.user_id`
+	q := `SELECT ` + ruleCols + `, u.username,u.role,u.plan_id, (CASE WHEN ` + activeUserSQL + ` THEN 1 ELSE 0 END), ` + ruleWithinQuotaSQL + ` FROM rules r JOIN users u ON u.id=r.user_id`
 	args := []any{now()}
 	if !(u.IsAdmin() && r.URL.Query().Get("all") == "1") {
 		q += ` WHERE r.user_id=?`
@@ -716,10 +702,10 @@ func (s *Server) handleRuleList(w http.ResponseWriter, r *http.Request, u *User)
 	online, errs := s.hub.onlineCount(), s.hub.ruleErrors()
 	out := []*Rule{}
 	for rows.Next() {
-		var active bool
+		var active, withinQuota bool
 		var username string
 		var owner User
-		x, err := scanRule(rows, &username, &owner.Role, &owner.PlanID, &active)
+		x, err := scanRule(rows, &username, &owner.Role, &owner.PlanID, &active, &withinQuota)
 		if err != nil {
 			s.dbErr(w, err)
 			return
@@ -735,18 +721,20 @@ func (s *Server) handleRuleList(w http.ResponseWriter, r *http.Request, u *User)
 			x.Status = "paused"
 		case !active:
 			x.Status, x.Error = "inactive", "账号不可用(到期、流量用尽或被封禁)"
+		case !withinQuota:
+			x.Status, x.Error = "inactive", "规则超出当前套餐数量上限"
 		case policyErr != nil:
 			x.Status, x.Error = "inactive", policyErr.Error()
 		case errs[x.ID] != "":
 			x.Status, x.Error = "error", errs[x.ID]
 		default:
 			if x.TLSMode == proto.TLSModeChild {
-				p, ok := parents[[2]int64{x.InGroup, int64(x.ListenPort)}]
+				p, ok := parents[x.parentKey()]
 				switch {
 				case !ok:
 					x.Status, x.Error = "error", fmt.Sprintf("共享 TLS 端口 %d 已被管理员删除", x.ListenPort)
 				case !p.usable:
-					x.Status, x.Error = "offline", fmt.Sprintf("共享 TLS 端口 %d 已被暂停", x.ListenPort)
+					x.Status, x.Error = "offline", fmt.Sprintf("共享 TLS 端口 %d 当前不可用", x.ListenPort)
 				case errs[p.id] != "":
 					x.Status, x.Error = "error", fmt.Sprintf("共享 TLS 端口 %d 同步失败: %s", x.ListenPort, errs[p.id])
 				}
@@ -841,7 +829,7 @@ func (s *Server) ownedRule(w http.ResponseWriter, r *http.Request, u *User) *Rul
 		s.dbErr(w, err)
 		return nil
 	}
-	if rule.UserID != u.ID && !u.IsAdmin() {
+	if !u.IsAdmin() && (rule.UserID != u.ID || rule.TLSMode == proto.TLSModeParent) {
 		s.fail(w, http.StatusForbidden, "无权操作该规则")
 		return nil
 	}
@@ -875,6 +863,15 @@ func (s *Server) handleRuleUpdate(w http.ResponseWriter, r *http.Request, u *Use
 	owner, err := getUser(tx, old.UserID)
 	if err != nil {
 		s.dbErr(w, err)
+		return
+	}
+	var withinQuota bool
+	if err := tx.QueryRow(`SELECT `+ruleWithinQuotaSQL+` FROM rules r JOIN users u ON u.id=r.user_id WHERE r.id=?`, old.ID).Scan(&withinQuota); err != nil {
+		s.dbErr(w, err)
+		return
+	}
+	if !withinQuota {
+		s.fail(w, 400, "规则超出当前套餐数量上限")
 		return
 	}
 	policy, err := loadRulePolicy(tx)
@@ -980,9 +977,25 @@ func (s *Server) handleRuleDiag(w http.ResponseWriter, r *http.Request, u *User)
 		s.dbErr(w, err)
 		return
 	}
-	if !owner.Active() || policy.authorize(owner, rule) != nil {
+	var withinQuota bool
+	if err := s.db.QueryRow(`SELECT `+ruleWithinQuotaSQL+` FROM rules r JOIN users u ON u.id=r.user_id WHERE r.id=?`, rule.ID).Scan(&withinQuota); err != nil {
+		s.dbErr(w, err)
+		return
+	}
+	if !withinQuota || !owner.Active() || policy.authorize(owner, rule) != nil {
 		s.fail(w, http.StatusForbidden, "规则当前未获授权")
 		return
+	}
+	if rule.TLSMode == proto.TLSModeChild {
+		parents, err := policy.tlsParents(s.db)
+		if err != nil {
+			s.dbErr(w, err)
+			return
+		}
+		if !parents[rule.parentKey()].usable {
+			s.fail(w, http.StatusForbidden, "共享 TLS 端口当前不可用")
+			return
+		}
 	}
 	hops := s.hub.diag(rule)
 	if !u.IsAdmin() { // 普通用户不展示出口节点的真实地址

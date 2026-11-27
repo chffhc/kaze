@@ -465,6 +465,10 @@ func (h *Hub) buildConfig(groupID int64) (*proto.NodeConfig, error) {
 }
 
 func (h *Hub) buildInbound(g *Group, all []*Group, policy *rulePolicy) (*proto.InboundConfig, error) {
+	parents, err := policy.tlsParents(h.s.db)
+	if err != nil {
+		return nil, err
+	}
 	groups := policy.groups
 	gc := &g.Config
 	in := &proto.InboundConfig{
@@ -486,7 +490,7 @@ func (h *Hub) buildInbound(g *Group, all []*Group, policy *rulePolicy) (*proto.I
 		}
 	}
 	rows, err := h.s.db.Query(`SELECT `+ruleCols+`,u.speed_limit,u.conn_limit,u.ip_limit,u.role,u.plan_id FROM rules r
-		JOIN users u ON u.id=r.user_id WHERE r.in_group=? AND r.paused=0 AND `+activeUserSQL+` ORDER BY r.id`, g.ID, now())
+		JOIN users u ON u.id=r.user_id WHERE r.in_group=? AND r.paused=0 AND `+activeUserSQL+` AND `+ruleWithinQuotaSQL+` ORDER BY r.id`, g.ID, now())
 	if err != nil {
 		return nil, err
 	}
@@ -498,7 +502,7 @@ func (h *Hub) buildInbound(g *Group, all []*Group, policy *rulePolicy) (*proto.I
 		if err != nil {
 			return nil, err
 		}
-		if policy.authorize(&owner, r) != nil {
+		if policy.authorize(&owner, r) != nil || r.TLSMode == proto.TLSModeChild && !parents[r.parentKey()].usable {
 			continue
 		}
 		pr := proto.Rule{
@@ -510,6 +514,14 @@ func (h *Hub) buildInbound(g *Group, all []*Group, policy *rulePolicy) (*proto.I
 			hops, chain, ok := groups.hops(r.OutGroup)
 			// 回源 TLS 由最后一跳执行。经隧道时也告诉入口一声:它据此决定要不要把协商出的 ALPN 带给最后一跳。
 			pr.OriginTLS = r.originTLS()
+			if len(hops) > 0 {
+				var hopIDs []int64
+				for _, hop := range hops {
+					hopIDs = append(hopIDs, hop.ID)
+				}
+				route, _ := json.Marshal([]any{r.OutGroup, hopIDs, r.Targets, r.ProxyProtocol, chain != nil && chain.Config.ChainMux})
+				pr.RouteFingerprint = fmt.Sprintf("%x", sha256.Sum256(route))
+			}
 			switch {
 			case !ok:
 				continue
@@ -536,6 +548,10 @@ func (h *Hub) buildInbound(g *Group, all []*Group, policy *rulePolicy) (*proto.I
 }
 
 func (h *Hub) buildOutbound(g *Group, all []*Group, policy *rulePolicy) (*proto.OutboundConfig, error) {
+	parents, err := policy.tlsParents(h.s.db)
+	if err != nil {
+		return nil, err
+	}
 	groups := policy.groups
 	gc := &g.Config
 	out := &proto.OutboundConfig{
@@ -590,7 +606,7 @@ func (h *Hub) buildOutbound(g *Group, all []*Group, policy *rulePolicy) (*proto.
 		}
 	}
 	rows, err := h.s.db.Query(`SELECT `+ruleCols+`,u.role,u.plan_id FROM rules r JOIN users u ON u.id=r.user_id
-		WHERE r.out_group IN (`+ph+`) AND r.paused=0 AND r.tls_mode<>'parent' AND `+activeUserSQL+` ORDER BY r.id`, append(ids, now())...)
+		WHERE r.out_group IN (`+ph+`) AND r.paused=0 AND r.tls_mode<>'parent' AND `+activeUserSQL+` AND `+ruleWithinQuotaSQL+` ORDER BY r.id`, append(ids, now())...)
 	if err != nil {
 		return nil, err
 	}
@@ -601,7 +617,7 @@ func (h *Hub) buildOutbound(g *Group, all []*Group, policy *rulePolicy) (*proto.
 		if err != nil {
 			return nil, err
 		}
-		if policy.authorize(&owner, r) != nil {
+		if policy.authorize(&owner, r) != nil || r.TLSMode == proto.TLSModeChild && !parents[r.parentKey()].usable {
 			continue
 		}
 		hops, chain, ok := groups.hops(r.OutGroup)

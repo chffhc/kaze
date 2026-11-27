@@ -117,9 +117,10 @@ type Rule struct {
 	ConnLimit     int      `json:"conns"`   // 规则级连接数限制
 	IPLimit       int      `json:"ips"`     // 规则级 IP 数限制
 
-	TLS       *TLSInbound `json:"tls,omitempty"`        // TLS 入站;子规则的 ListenPort 是母规则的端口
-	OriginTLS *OriginTLS  `json:"origin_tls,omitempty"` // 回源 TLS:直出时由入口执行;经隧道时由最后一跳执行,入口只据此决定是否传递 ALPN
-	UDPStream bool        `json:"udp_stream,omitempty"` // UDP 必须封装进隧道流(链式出口)
+	TLS              *TLSInbound `json:"tls,omitempty"`               // TLS 入站;子规则的 ListenPort 是母规则的端口
+	OriginTLS        *OriginTLS  `json:"origin_tls,omitempty"`        // 回源 TLS:直出时由入口执行;经隧道时由最后一跳执行,入口只据此决定是否传递 ALPN
+	RouteFingerprint string      `json:"route_fingerprint,omitempty"` // invalidates established streams when the remote route changes
+	UDPStream        bool        `json:"udp_stream,omitempty"`        // UDP 必须封装进隧道流(链式出口)
 }
 
 // UserLimit 是用户级限制(同一入口节点上该用户的所有规则共享)。

@@ -46,9 +46,10 @@ type Options struct {
 }
 
 type state struct {
-	UID        string            `json:"uid"`
-	TunnelPort int               `json:"tunnel_port,omitempty"`
-	LastConfig *proto.NodeConfig `json:"last_config,omitempty"`
+	UID         string            `json:"uid"`
+	TunnelPort  int               `json:"tunnel_port,omitempty"`
+	ConfigOwner string            `json:"config_owner,omitempty"`
+	LastConfig  *proto.NodeConfig `json:"last_config,omitempty"`
 }
 
 // Agent 是节点端主体。
@@ -134,8 +135,21 @@ func Run(ctx context.Context, opt Options) (runErr error) {
 	}
 	if d != nil {
 		var err error
+		owner := trafficOwner(opt, a.state.UID)
+		if a.state.ConfigOwner != "" && a.state.ConfigOwner != owner {
+			a.state.LastConfig = nil
+			if err := a.saveState(); err != nil {
+				return err
+			}
+		}
 		a.traffic, err = loadTraffic(opt, a.state.UID, d)
 		if err != nil {
+			return err
+		}
+	}
+	if a.traffic != nil && a.traffic.rebound {
+		a.state.LastConfig = nil
+		if err := a.saveState(); err != nil {
 			return err
 		}
 	}
@@ -218,6 +232,11 @@ func Run(ctx context.Context, opt Options) (runErr error) {
 }
 
 func (a *Agent) applyConfig(cfg *proto.NodeConfig, persist bool) error {
+	if persist && a.traffic != nil {
+		if err := a.traffic.bindGroup(a.opt, a.state.UID, cfg.GroupID); err != nil {
+			return errors.Join(err, a.revokeConfig())
+		}
+	}
 	if cfg.Now > 0 {
 		a.clockOff.Store(int64(time.UnixMilli(cfg.Now).Sub(time.Now())))
 	}
@@ -232,19 +251,44 @@ func (a *Agent) applyConfig(cfg *proto.NodeConfig, persist bool) error {
 		a.in.apply(cfg.Inbound)
 	case proto.RoleOut:
 		if cfg.Outbound == nil {
-			return errors.New("出口配置为空")
+			err = errors.New("出口配置为空")
+			break
 		}
 		a.in.stopAll()
 		err = a.out.apply(cfg.Outbound, cfg.GroupID)
 	default:
-		return errors.New("未知的节点角色: " + cfg.Role)
+		err = errors.New("未知的节点角色: " + cfg.Role)
 	}
 	a.cfgVer.Store(cfg.Version)
-	if persist && err == nil {
+	if persist {
+		if err != nil {
+			return errors.Join(err, a.revokeConfig())
+		}
 		a.state.LastConfig = cfg
-		return a.saveState()
+		if a.opt.PanelURL != "" {
+			a.state.ConfigOwner = trafficOwner(a.opt, a.state.UID)
+		}
+		if err := a.saveState(); err != nil {
+			return errors.Join(err, a.revokeConfig())
+		}
 	}
 	return err
+}
+
+func (a *Agent) revokeConfig() error {
+	a.in.stopAll()
+	a.out.stopAll()
+	a.cfgVer.Store(0)
+	a.state.LastConfig = nil
+	if err := a.saveState(); err != nil {
+		// ENOSPC can prevent rewriting the cache while still allowing unlink.
+		removeErr := os.Remove(a.statePath())
+		if !errors.Is(removeErr, os.ErrNotExist) {
+			err = errors.Join(err, removeErr, syncTrafficDir(a.opt.StateDir))
+		}
+		return err
+	}
+	return nil
 }
 
 func (a *Agent) send(t string, v any) {
@@ -290,7 +334,7 @@ func (a *Agent) session(ctx context.Context) error {
 		if resp != nil {
 			resp.Body.Close()
 			if resp.StatusCode == http.StatusUnauthorized {
-				return errors.New("对接令牌无效(设备组可能已删除或令牌已重置)")
+				return errors.Join(errors.New("对接令牌无效(设备组可能已删除或令牌已重置)"), a.revokeConfig())
 			}
 		}
 		return err
