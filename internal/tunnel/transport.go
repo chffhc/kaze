@@ -54,18 +54,17 @@ var fingerprints = map[string]utls.ClientHelloID{
 	"ios":     utls.HelloIOS_Auto,
 	"android": utls.HelloAndroid_11_OkHttp,
 	"edge":    utls.HelloEdge_Auto,
-	"360":     utls.Hello360_Auto,
 	"qq":      utls.HelloQQ_Auto,
 }
 
 // Fingerprints 返回支持的指纹名称(固定顺序,供界面展示)。
 func Fingerprints() []string {
-	return []string{"chrome", "firefox", "safari", "ios", "android", "edge", "360", "qq"}
+	return []string{"chrome", "firefox", "safari", "ios", "android", "edge", "qq"}
 }
 
 // ValidFingerprint 报告指纹名称是否合法;空字符串表示不伪装。
 func ValidFingerprint(fp string) bool {
-	if fp == "" {
+	if fp == "" || fp == "360" {
 		return true
 	}
 	_, ok := fingerprints[fp]
@@ -155,14 +154,23 @@ func checkPin(certs []*x509.Certificate, pin string) error {
 }
 
 // exportEKM 返回本次 TLS 会话的导出密钥,用来把隧道鉴权绑定到这条连接上。
-// 协商到 TLS 1.2 且没有 EMS 时无法导出(个别指纹预设会如此),此时返回 nil,
-// 两端都会退回到"时间戳 + 一次性随机数"的校验方式。
-func exportEKM(export func(label string, context []byte, length int) ([]byte, error)) []byte {
-	b, err := export(ekmLabel, nil, 32)
-	if err != nil {
-		return nil
+func exportEKM(export func(string, []byte, int) ([]byte, error)) ([]byte, error) {
+	return export(ekmLabel, nil, 32)
+}
+
+func safeTLS(version, suite uint16) bool {
+	if version == tls.VersionTLS13 {
+		return true
 	}
-	return b
+	if version != tls.VersionTLS12 {
+		return false
+	}
+	switch suite {
+	case tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384, tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+		tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256, tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384, tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256:
+		return true
+	}
+	return false
 }
 
 // tlsDialer 完成入口侧(以及反向隧道里出口侧)的 TLS 握手:
@@ -176,6 +184,9 @@ type tlsDialer struct {
 }
 
 func newTLSDialer(sni, pin, fp string, alpn []string) *tlsDialer {
+	if fp == "360" {
+		fp = ""
+	} // Legacy configs use Go TLS in place of the obsolete preset.
 	d := &tlsDialer{sni: sni, pin: pin, fp: fp, alpn: alpn}
 	d.std = &tls.Config{
 		ServerName:         sni,
@@ -192,7 +203,7 @@ func newTLSDialer(sni, pin, fp string, alpn []string) *tlsDialer {
 }
 
 // handshake 在 raw 上完成握手。握手失败时不关闭 raw,由调用方处理。
-// 返回的 ekm 只在固定了证书指纹时才有:经 CDN 的连接两端不是同一个 TLS 会话,没法绑定。
+// 成功时返回本次 TLS 会话的通道绑定。
 func (d *tlsDialer) handshake(ctx context.Context, raw net.Conn, endpoint string) (net.Conn, []byte, error) {
 	name := d.sni
 	if name == "" && d.pin == "" { // CA 校验模式必须有服务器名
@@ -208,11 +219,12 @@ func (d *tlsDialer) handshake(ctx context.Context, raw net.Conn, endpoint string
 		if err := tc.HandshakeContext(ctx); err != nil {
 			return nil, nil, err
 		}
-		if d.pin == "" {
-			return tc, nil, nil
-		}
 		cs := tc.ConnectionState()
-		return tc, exportEKM(cs.ExportKeyingMaterial), nil
+		if !safeTLS(cs.Version, cs.CipherSuite) {
+			return nil, nil, errAuth
+		}
+		ekm, err := exportEKM(cs.ExportKeyingMaterial)
+		return tc, ekm, err
 	}
 
 	spec, err := utls.UTLSIdToSpec(fingerprints[d.fp])
@@ -237,7 +249,20 @@ func (d *tlsDialer) handshake(ctx context.Context, raw net.Conn, endpoint string
 		exts = append(exts, e)
 	}
 	spec.Extensions = exts
-	cfg := &utls.Config{ServerName: name}
+	if spec.TLSVersMax == 0 {
+		spec.TLSVersMax = tls.VersionTLS12
+		for _, ext := range spec.Extensions {
+			if versions, ok := ext.(*utls.SupportedVersionsExtension); ok {
+				for _, v := range versions.Versions {
+					if v == tls.VersionTLS13 {
+						spec.TLSVersMax = v
+					}
+				}
+			}
+		}
+	}
+	spec.TLSVersMin = max(spec.TLSVersMin, tls.VersionTLS12)
+	cfg := &utls.Config{ServerName: name, MinVersion: tls.VersionTLS12}
 	if d.pin != "" {
 		cfg.InsecureSkipVerify = true
 		cfg.VerifyConnection = func(cs utls.ConnectionState) error { return checkPin(cs.PeerCertificates, d.pin) }
@@ -249,16 +274,18 @@ func (d *tlsDialer) handshake(ctx context.Context, raw net.Conn, endpoint string
 	if err := uc.HandshakeContext(ctx); err != nil {
 		return nil, nil, err
 	}
-	if d.pin == "" {
-		return uc, nil, nil
-	}
 	cs := uc.ConnectionState()
-	return uc, exportEKM(cs.ExportKeyingMaterial), nil
+	if !safeTLS(cs.Version, cs.CipherSuite) {
+		return nil, nil, errAuth
+	}
+	ekm, err := exportEKM(cs.ExportKeyingMaterial)
+	return uc, ekm, err
 }
 
 // dialSpec 描述入口如何连接出口的某个 endpoint。
 type dialSpec struct {
 	transport string
+	cdn       bool
 	host      string // ws / http 的 Host 头
 	path      string
 	keys      *Keys
@@ -330,7 +357,9 @@ func (s *dialSpec) dial(ctx context.Context, endpoint string, flags byte, buf []
 					raw.Close()
 					return nil, err
 				}
-				ekm = e
+				if !s.cdn {
+					ekm = e
+				}
 				return tc, nil
 			}
 		}
@@ -338,13 +367,15 @@ func (s *dialSpec) dial(ctx context.Context, endpoint string, flags byte, buf []
 		if host == "" {
 			host = endpoint
 		}
-		wc, resp, err := d.DialContext(ctx, scheme+"://"+host+s.path, http.Header{"User-Agent": {httpUserAgent}})
+		token, _ := newHandshakeToken(s.keys, flags, s.now(), "ws-upgrade")
+		wc, resp, err := d.DialContext(ctx, scheme+"://"+host+s.path, http.Header{"User-Agent": {httpUserAgent}, "Authorization": {"Kaze " + token}})
 		if resp != nil && resp.Body != nil {
 			resp.Body.Close()
 		}
 		if err != nil {
 			return nil, nil, err
 		}
+		wc.SetReadLimit(int64(MuxWindow) + 65536)
 		return &wsConn{Conn: wc}, appendPreface(buf, s.keys, flags, ekm, s.now()), nil
 	}
 	return nil, nil, errors.New("未知的隧道传输层: " + s.transport)

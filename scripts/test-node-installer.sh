@@ -4,7 +4,7 @@ set -eu
 src=$(cd "$(dirname "$0")/../internal/panel" && pwd)/install.sh
 docker run --rm -i --pull=never --network=none --read-only --cap-drop=ALL \
   --security-opt=no-new-privileges --tmpfs /opt:exec,mode=755 --tmpfs /etc/systemd/system:mode=755 \
-  --tmpfs /tmp:exec --mount "type=bind,source=$src,target=/installer,readonly" \
+  --tmpfs /etc/sysctl.d:mode=755 --tmpfs /tmp:exec --mount "type=bind,source=$src,target=/installer,readonly" \
   --entrypoint bash python:3.13-slim -se <<'TESTS'
 mkdir /tmp/bin
 export PATH=/tmp/bin:$PATH
@@ -78,6 +78,11 @@ touch /tmp/download-fails; reject install_node partial
 test ! -e /opt/partial; rm /tmp/download-fails
 install_node partial; uninstall_node partial
 echo 'PASS fresh install can retry a failed download'
+printf 'preserve' > /tmp/sysctl-target
+ln -s /tmp/sysctl-target /etc/sysctl.d/99-kaze.conf
+OPTIMIZE=1 reject install_node optimized
+test "$(cat /tmp/sysctl-target)" = preserve && test ! -e /opt/optimized
+echo 'PASS sysctl override refuses symlink before installing'
 install_node busy; touch /tmp/stop-fails
 if uninstall_node busy; then exit 1; fi
 test -f /opt/busy/env && test -f /etc/systemd/system/busy.service || exit 1

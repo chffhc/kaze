@@ -7,7 +7,6 @@ import (
 	"net/netip"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/libp2p/go-yamux/v5"
@@ -15,8 +14,6 @@ import (
 	"kaze/internal/proto"
 	"kaze/internal/relay"
 )
-
-func isConnRefused(err error) bool { return errors.Is(err, syscall.ECONNREFUSED) }
 
 const (
 	// 单条复用连接上的并发流达到这个数就再开一条连接(直到 MuxConns),缓解队头阻塞。
@@ -45,7 +42,6 @@ type Client struct {
 	keys     *Keys
 	ds       *dialSpec
 	bal      *relay.Balancer
-	udp      *UDPCipher
 	now      func() time.Time
 	fallback *Client
 	rev      *ReverseListener
@@ -77,7 +73,6 @@ func newClient(spec *proto.TunnelSpec, o ClientOpts, withFallback bool) (*Client
 		Spec:   *spec,
 		keys:   keys,
 		bal:    relay.NewBalancer(spec.Endpoints, relay.LBLeastConn, o.MaxFail, o.FailTimeout),
-		udp:    NewUDPCipher(keys, true),
 		now:    o.Now,
 		pools:  make(map[*relay.Backend]*muxPool),
 		closed: make(chan struct{}),
@@ -95,7 +90,7 @@ func newClient(spec *proto.TunnelSpec, o ClientOpts, withFallback bool) (*Client
 	if path == "" {
 		path = "/"
 	}
-	c.ds = &dialSpec{transport: spec.Transport, host: spec.Host, path: path, keys: keys, now: o.Now}
+	c.ds = &dialSpec{cdn: spec.CDN, transport: spec.Transport, host: spec.Host, path: path, keys: keys, now: o.Now}
 	c.ds.nd = net.Dialer{Timeout: dialTimeout, KeepAlive: 30 * time.Second}
 	switch spec.Transport {
 	case TransportTLS:
@@ -293,11 +288,7 @@ func (c *Client) OpenUDP(ctx context.Context, ruleID uint32, src netip.AddrPort,
 	if err != nil {
 		return nil, err
 	}
-	uc, err := net.DialUDP("udp", nil, raddr)
-	if err != nil {
-		return nil, err
-	}
-	return &nativeUDP{UDPConn: uc, c: c.udp, ruleID: ruleID}, nil
+	return dialNativeUDP(ctx, raddr, c.keys, ruleID)
 }
 
 // Endpoints 返回出口节点地址列表(诊断用);反向隧道没有可拨的地址。
@@ -498,37 +489,4 @@ type streamUDP struct {
 func (u *streamUDP) Close() error {
 	u.done()
 	return u.StreamUpstream.Close()
-}
-
-// nativeUDP 是到出口原生 UDP 端口的加密上游。
-type nativeUDP struct {
-	*net.UDPConn
-	c      *UDPCipher
-	ruleID uint32
-	wbuf   []byte
-}
-
-func (u *nativeUDP) Send(p []byte) error {
-	u.wbuf = u.c.Seal(u.wbuf[:0], u.ruleID, p)
-	if _, err := u.Write(u.wbuf); err != nil && errors.Is(err, net.ErrClosed) {
-		return err
-	}
-	return nil
-}
-
-func (u *nativeUDP) Recv(b []byte) (int, error) {
-	for {
-		n, err := u.Read(b)
-		if err != nil {
-			if isConnRefused(err) {
-				continue
-			}
-			return 0, err
-		}
-		_, pt, ok := u.c.Open(b[:n])
-		if !ok {
-			continue
-		}
-		return copy(b, pt), nil
-	}
 }

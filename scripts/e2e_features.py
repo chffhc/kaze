@@ -30,6 +30,9 @@ def main():
     def groups():
         return {g["id"]: g for g in api("GET", "/api/admin/groups", token=admin)}
 
+    def detail(g):
+        return api("GET", f"/api/admin/groups/{g['id']}", token=admin)
+
     def nodes():
         return api("GET", "/api/admin/nodes", token=admin)
 
@@ -37,13 +40,18 @@ def main():
     g_http = group("HTTP 伪装出口", "out", 0.5, transport="http", ws_path="/api/v2/sync", allow_private=True)
     g_fp = group("Chrome 指纹出口", "out", 0.5, transport="tls", fingerprint="chrome", allow_private=True)
     g_wss = group("WSS 出口", "out", 0.5, transport="wss", fingerprint="firefox", allow_private=True)
-    g_rev = group("内网出口", "out", 2.0, transport="tls", allow_private=True)
+    g_rev = group("内网出口", "out", 2.0, transport="tls", allow_private=True, connect_host="127.0.0.9")
     chain = group("三跳线路", "chain", 3.0, chain_hops=[g_http["id"], g_fp["id"], g_wss["id"]], chain_mux=False)
     g_in = group("入口", "in", 1.0, port_range="22000-22100,22440-22449", allow_private=True,
                  reverse_groups=[g_rev["id"]], reverse_sni="edge.example.com")
     check("出口组保存了传输层与指纹设置", g_http["config"]["transport"] == "http" and g_fp["config"]["fingerprint"] == "chrome")
     check("链式出口没有对接命令", chain["install_cmd"] == "" and chain["config"]["chain_hops"] == [g_http["id"], g_fp["id"], g_wss["id"]])
     check("入口组自动生成了反向隧道证书", len(g_in["config"]["rev_cert_pin"]) == 64 and "BEGIN CERTIFICATE" in g_in["config"]["rev_cert_pem"])
+    summaries = groups().values()
+    check("轮询设备组列表省略令牌和私钥，按需读取详情保留对接命令",
+          all(not g.get("token") and not g.get("install_cmd") and
+              not any(g["config"].get(key) for key in ("tunnel_key", "key_pem", "rev_key_pem")) for g in summaries)
+          and detail(g_http)["token"] == g_http["token"] and detail(g_http)["install_cmd"] == g_http["install_cmd"])
     for bad, why in (
         ({"name": "x", "type": "chain", "config": {"chain_hops": [g_http["id"]]}}, "只有一跳"),
         ({"name": "x", "type": "chain", "config": {"chain_hops": [g_http["id"], g_http["id"]]}}, "同一个组出现两次"),
@@ -266,7 +274,7 @@ def main():
 
     set_out(g_fp, failover_group=g_wss["id"])
     check("修改出口组不会更换它的密钥和证书", groups()[g_fp["id"]]["config"]["cert_pin"] == g_fp["config"]["cert_pin"]
-          and groups()[g_fp["id"]]["config"]["tunnel_key"] == g_fp["config"]["tunnel_key"])
+          and detail(g_fp)["config"]["tunnel_key"] == g_fp["config"]["tunnel_key"])
     time.sleep(1.5)
     # 新建规则后马上让主出口宕机:备用组必须已经拿到这条规则
     r_fo = rule("故障转移", g_fp["id"], listen_port=22006)

@@ -45,6 +45,7 @@ const AdminUsersPage = {
     const users = ref(null), plans = ref([]), q = ref(''), form = ref(null);
     const load = () => run(async () => { users.value = await api('GET', '/api/admin/users' + (q.value ? '?q=' + encodeURIComponent(q.value) : '')); });
     onMounted(() => { load(); run(async () => { plans.value = await api('GET', '/api/admin/plans'); }); });
+    let initial;
     function open(u) {
       form.value = u ? {
         id: u.id, username: u.username, password: '', role: u.role, balance: u.balance / 100, plan_id: u.plan_id,
@@ -52,6 +53,7 @@ const AdminUsersPage = {
         max_rules: u.max_rules, speed_limit: u.speed_limit, conn_limit: u.conn_limit, ip_limit: u.ip_limit, banned: u.banned, note: u.note || '',
       } : { id: 0, username: '', password: '', role: 'user', balance: 0, plan_id: 0, quota_gb: 0, used_gb: 0, expire: '',
         max_rules: 0, speed_limit: 0, conn_limit: 0, ip_limit: 0, banned: false, note: '' };
+      initial = { ...form.value };
     }
     // 选择套餐时把套餐的额度填进表单(仍可再手动调整)
     function applyPlan() {
@@ -69,6 +71,13 @@ const AdminUsersPage = {
         expire_at: fmt.fromLocalInput(f.expire), max_rules: Number(f.max_rules) || 0, speed_limit: Number(f.speed_limit) || 0,
         conn_limit: Number(f.conn_limit) || 0, ip_limit: Number(f.ip_limit) || 0, banned: f.banned, note: f.note,
       };
+      if (f.id) {
+        const fields = { traffic_quota: 'quota_gb', traffic_used: 'used_gb', expire_at: 'expire' };
+        for (const key of Object.keys(body)) {
+          const field = fields[key] || key;
+          if (f[field] === initial[field]) delete body[key];
+        }
+      }
       if (f.password) body.password = f.password;
       const ok = await run(() => f.id ? api('PUT', '/api/admin/users/' + f.id, body) : api('POST', '/api/admin/users', body), f.id ? '用户已保存' : '用户已创建');
       if (ok) { form.value = null; load(); }
@@ -147,7 +156,7 @@ const AdminUsersPage = {
 };
 
 // ---- 设备组与节点 ----
-const fingerprints = ['chrome', 'firefox', 'safari', 'ios', 'android', 'edge', '360', 'qq'];
+const fingerprints = ['chrome', 'firefox', 'safari', 'ios', 'android', 'edge', 'qq'];
 const groupTypeText = { in: '入口组', out: '出口组', chain: '链式出口' };
 
 function blankGroup(type) {
@@ -206,7 +215,10 @@ const AdminGroupsPage = {
         c.chain_hops = [f.hop1, f.hop2, f.hop3].map(Number).filter(Boolean);
       }
     }
-    function open(g, type) {
+    const details = g => run(() => api('GET', '/api/admin/groups/' + g.id));
+    async function showInstall(g) { install.value = await details(g); }
+    async function open(g, type) {
+      if (g) { g = await details(g); if (!g) return; }
       const f = blankGroup(g ? g.type : type);
       if (g) {
         Object.assign(f, { id: g.id, name: g.name, ratio: g.ratio, public: g.public, sort: g.sort, note: g.note });
@@ -267,7 +279,7 @@ const AdminGroupsPage = {
       return '-';
     };
     const gtype = id => { const g = (groups.value || []).find(x => x.id === id); return g ? g.type : ''; };
-    return { groups, nodes, ins, outs, chains, sections, gname, gtype, form, install, open, toggleAdvanced, save, remove, resetToken, removeNode,
+    return { groups, nodes, ins, outs, chains, sections, gname, gtype, form, install, showInstall, open, toggleAdvanced, save, remove, resetToken, removeNode,
       fmt, copyText, directText, tlsPolicyText, usesTLS, forcedMux, nodeAddr, fingerprints, groupTypeText };
   },
   template: `
@@ -297,7 +309,7 @@ const AdminGroupsPage = {
             <td v-else-if="sec.type === 'out'">{{ g.config.cdn ? 'ws 经 CDN' : g.config.transport }}<span class="sub">{{ g.config.mux ? ',复用' : '' }}{{ g.config.fingerprint && usesTLS(g.config) ? ',' + g.config.fingerprint + ' 指纹' : '' }}{{ g.config.failover_group ? ',备用 ' + gname(g.config.failover_group) : '' }}</span></td>
             <td v-else><div class="route"><template v-for="(h, i) in g.config.chain_hops" :key="h"><span class="wire" v-if="i"></span><span class="hop">{{ gname(h) }}</span></template></div></td>
             <td><span class="tag" :class="g.public ? 'ok' : ''">{{ g.public ? '所有用户' : '仅授权套餐' }}</span></td>
-            <td class="ops"><button class="link" v-if="sec.type !== 'chain'" @click="install = g">对接</button><button class="link" @click="open(g)">编辑</button><button class="link danger" @click="remove(g)">删除</button></td>
+            <td class="ops"><button class="link" v-if="sec.type !== 'chain'" @click="showInstall(g)">对接</button><button class="link" @click="open(g)">编辑</button><button class="link danger" @click="remove(g)">删除</button></td>
           </tr></tbody>
         </table>
       </div>

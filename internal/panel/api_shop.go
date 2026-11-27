@@ -22,7 +22,7 @@ func orderNo() string {
 }
 
 func (s *Server) handlePlans(w http.ResponseWriter, r *http.Request, u *User) {
-	plans, err := listPlans(s.db, false)
+	plans, err := listPlans(s.reader(), false)
 	if err != nil {
 		s.dbErr(w, err)
 		return
@@ -78,7 +78,7 @@ func (s *Server) purchase(userID, planID int64, typ string) error {
 	if err != nil {
 		return errors.New("套餐不存在")
 	}
-	if p.Hidden && typ == "plan" && !u.IsAdmin() {
+	if p.Hidden && (typ != "plan" || !u.IsAdmin()) {
 		return errors.New("套餐已下架")
 	}
 	if u.Balance < p.Price {
@@ -111,12 +111,12 @@ func (s *Server) handleBuy(w http.ResponseWriter, r *http.Request, u *User) {
 		}
 		return
 	}
-	nu, _ := getUser(s.db, u.ID)
+	nu, _ := getUser(s.reader(), u.ID)
 	s.ok(w, nu)
 }
 
 func (s *Server) queryOrders(where string, args ...any) ([]*Order, error) {
-	rows, err := s.db.Query(`SELECT o.id,o.order_no,o.user_id,COALESCE(u.username,''),o.type,o.plan_id,o.amount,o.status,
+	rows, err := s.reader().Query(`SELECT o.id,o.order_no,o.user_id,COALESCE(u.username,''),o.type,o.plan_id,o.amount,o.status,
 		o.pay_method,o.trade_no,o.note,o.created_at,o.paid_at FROM orders o LEFT JOIN users u ON u.id=o.user_id `+
 		where+` ORDER BY o.id DESC LIMIT 500`, args...)
 	if err != nil {
@@ -267,10 +267,29 @@ func (s *Server) handleRecharge(w http.ResponseWriter, r *http.Request, u *User)
 	if in.Method == "" {
 		in.Method = "alipay"
 	}
+	allowed := false
+	for _, method := range strings.Split(s.setting("epay_types", "alipay,wxpay"), ",") {
+		if in.Method == strings.TrimSpace(method) && method != "" {
+			allowed = true
+			break
+		}
+	}
+	if !allowed {
+		s.fail(w, 400, "支付通道未启用")
+		return
+	}
 	no := orderNo()
-	if _, err := s.db.Exec(`INSERT INTO orders(order_no,user_id,type,amount,status,pay_method,note,created_at)
-		VALUES(?,?,'recharge',?,'pending',?,'余额充值',?)`, no, u.ID, cents, in.Method, now()); err != nil {
+	res, err := s.db.Exec(`INSERT INTO orders(order_no,user_id,type,amount,status,pay_method,note,created_at)
+		SELECT ?,?,'recharge',?,'pending',?,'余额充值',? WHERE (SELECT COUNT(*) FROM orders WHERE user_id=? AND type='recharge' AND status='pending')<5`, no, u.ID, cents, in.Method, now(), u.ID)
+	if err != nil {
 		s.dbErr(w, err)
+		return
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		s.dbErr(w, err)
+		return
+	} else if n == 0 {
+		s.fail(w, 429, "待支付订单已达上限")
 		return
 	}
 	base := s.baseURL(r)
@@ -296,7 +315,7 @@ func (s *Server) handleEpayNotify(w http.ResponseWriter, r *http.Request) {
 		p[k] = r.Form.Get(k)
 	}
 	key := s.setting("epay_key", "")
-	if key == "" || subtle.ConstantTimeCompare([]byte(epaySign(p, key)), []byte(strings.ToLower(p["sign"]))) != 1 {
+	if key == "" || p["pid"] == "" || p["pid"] != s.setting("epay_pid", "") || subtle.ConstantTimeCompare([]byte(epaySign(p, key)), []byte(strings.ToLower(p["sign"]))) != 1 {
 		http.Error(w, "fail", http.StatusBadRequest)
 		return
 	}

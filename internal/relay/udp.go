@@ -21,8 +21,8 @@ type Upstream interface {
 }
 
 const (
-	udpSessBuf   = 16 * 1024 // 每会话回程缓冲
-	udpQueueLen  = 128       // 每会话上行队列(满则丢包)
+	udpSessBuf   = 65535 // 每会话回程缓冲
+	udpQueueLen  = 128   // 每会话上行队列(满则丢包)
 	udpSmallPkt  = 2048
 	defaultIdle  = 90 * time.Second
 	defaultMaxUS = 8192
@@ -35,7 +35,13 @@ var udpSessPool = sync.Pool{New: func() any { b := make([]byte, udpSessBuf+64); 
 // 入口规则与出口的原生 UDP 通道共用这套实现,区别只在 Decode / Encode / Open。
 type UDPRelay struct {
 	workers sync.WaitGroup
-	Conn    *net.UDPConn
+	Conn    interface {
+		ReadFromUDPAddrPort([]byte) (int, netip.AddrPort, error)
+		WriteToUDPAddrPort([]byte, netip.AddrPort) (int, error)
+		LocalAddr() net.Addr
+		Close() error
+	}
+	Limits [2]*Limits
 	// Open 为新会话建立上游;在会话自己的协程里调用,可以阻塞(DNS、隧道握手)。
 	Open func(client netip.AddrPort, tag uint32) (Upstream, error)
 	// Decode 解析收到的报文(出口用于解密并取出规则号);为 nil 表示原样转发。
@@ -126,9 +132,6 @@ func (r *UDPRelay) Serve() {
 		copy(*pb, payload)
 		select {
 		case s.q <- pb:
-			if r.Up != nil {
-				r.Up.Add(int64(len(payload)))
-			}
 		default:
 			putSmall(pb)
 		}
@@ -151,7 +154,7 @@ func (r *UDPRelay) newSession(key udpSessionKey) *udpSession {
 	if s := r.sessions[key]; s != nil {
 		return s
 	}
-	if len(r.sessions) >= r.MaxSessions {
+	if len(r.sessions) >= r.MaxSessions || !AcquireAll(key.client.Addr(), r.Limits[:]...) {
 		return nil
 	}
 	s := &udpSession{r: r, udpSessionKey: key, q: make(chan *[]byte, udpQueueLen), quit: make(chan struct{})}
@@ -191,6 +194,7 @@ func (s *udpSession) run() {
 		}
 		r.mu.Unlock()
 		ActiveUDP.Add(-1)
+		ReleaseAll(s.client.Addr(), r.Limits[:]...)
 	}()
 	up, err := r.Open(s.client, s.tag)
 	if err != nil {
@@ -214,6 +218,9 @@ func (s *udpSession) run() {
 		case pb := <-s.q:
 			s.last.Store(time.Now().UnixNano())
 			err := up.Send(*pb)
+			if err == nil && r.Up != nil {
+				r.Up.Add(int64(len(*pb)))
+			}
 			putSmall(pb)
 			if err != nil {
 				return
@@ -294,10 +301,8 @@ type UDPConnUpstream struct{ *net.UDPConn }
 // Send 发送一个报文。已 connect 的 UDP 套接字会把 ICMP 不可达反映为写错误,
 // 这类瞬时错误不应该拆掉会话。
 func (u UDPConnUpstream) Send(p []byte) error {
-	if _, err := u.Write(p); err != nil && errors.Is(err, net.ErrClosed) {
-		return err
-	}
-	return nil
+	_, err := u.Write(p)
+	return err
 }
 
 // Recv 接收一个报文,忽略 ICMP 导致的 ECONNREFUSED。

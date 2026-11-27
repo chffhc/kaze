@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -83,6 +84,7 @@ func NewServer(cfg ServerConfig, h Handler) (*Server, error) {
 		s.hs = &http.Server{
 			Handler:           http.HandlerFunc(s.serveWS),
 			ReadHeaderTimeout: handshakeTimeout,
+			IdleTimeout:       30 * time.Second,
 			ErrorLog:          log.New(io.Discard, "", 0),
 		}
 		if useTLS {
@@ -170,7 +172,14 @@ func (s *Server) handleRaw(c net.Conn) {
 			return
 		}
 		cs := tc.ConnectionState()
-		s.authAndServe(tc, exportEKM(cs.ExportKeyingMaterial))
+		if !safeTLS(cs.Version, cs.CipherSuite) {
+			return
+		}
+		ekm, err := exportEKM(cs.ExportKeyingMaterial)
+		if err != nil {
+			return
+		}
+		s.authAndServe(tc, ekm)
 	default:
 		s.authAndServe(c, nil)
 	}
@@ -187,15 +196,34 @@ func (s *Server) serveWS(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	header := r.Header.Get("Authorization")
+	if !strings.HasPrefix(header, "Kaze ") {
+		http.Error(w, "unauthorized", 401)
+		return
+	}
+	if _, _, err := verifyHandshakeToken(strings.TrimPrefix(header, "Kaze "), s.cfg.Keys, s.cfg.Now(), &s.rc, "ws-upgrade"); err != nil {
+		http.Error(w, "unauthorized", 401)
+		return
+	}
 	var ekm []byte
 	if r.TLS != nil {
-		ekm = exportEKM(r.TLS.ExportKeyingMaterial)
+		if !safeTLS(r.TLS.Version, r.TLS.CipherSuite) {
+			http.Error(w, "unauthorized", 401)
+			return
+		}
+		var err error
+		ekm, err = exportEKM(r.TLS.ExportKeyingMaterial)
+		if err != nil {
+			http.Error(w, "unauthorized", 401)
+			return
+		}
 	}
 	wc, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
 	}
 	// 升级后的连接已被劫持,http.Server.Close 不再管它,需要自己登记
+	wc.SetReadLimit(int64(MuxWindow) + 65536)
 	conn := &wsConn{Conn: wc}
 	if !s.track(conn) {
 		conn.Close()

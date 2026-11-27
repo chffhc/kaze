@@ -115,9 +115,13 @@ func udpEcho(t *testing.T, addr string) {
 		t.Fatal(err)
 	}
 	defer c.Close()
-	buf := make([]byte, 2048)
+	buf := make([]byte, 65535)
 	for i := 0; i < 20; i++ {
-		msg := make([]byte, 100+i*60)
+		size := 100 + i*60
+		if i == 19 {
+			size = 16384
+		}
+		msg := make([]byte, size)
 		rand.Read(msg)
 		var n int
 		for try := 0; try < 5; try++ { // 会话首包可能因异步建会话而稍有延迟

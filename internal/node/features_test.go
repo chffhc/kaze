@@ -236,7 +236,7 @@ func TestHTTPAndFingerprintForward(t *testing.T) {
 		{tunnel.TransportTLS, true, "chrome"},
 		{tunnel.TransportTLS, false, "firefox"},
 		{tunnel.TransportWSS, true, "safari"},
-		{tunnel.TransportTLS, true, "360"}, // 协商到 TLS 1.2:鉴权退回时间戳校验
+		{tunnel.TransportTLS, true, "360"}, // 历史 360 配置使用标准 TLS 与通道绑定
 	}
 	for _, c := range cases {
 		t.Run(fmt.Sprintf("%s/mux=%v/fp=%s", c.transport, c.mux, c.fp), func(t *testing.T) {

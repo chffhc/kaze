@@ -6,6 +6,8 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"fmt"
 	"io"
@@ -232,6 +234,44 @@ func TestFingerprintChangesClientHello(t *testing.T) {
 	}
 }
 
+func TestCAAuthenticatedTLSChannelBinding(t *testing.T) {
+	pem, key, _, err := GenerateCert("example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := ParseCert(pem, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots := x509.NewCertPool()
+	roots.AddCert(cert.Leaf)
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	result := make(chan []byte, 1)
+	go func() {
+		c := tls.Server(server, &tls.Config{Certificates: []tls.Certificate{cert}})
+		if err := c.HandshakeContext(ctx); err != nil {
+			result <- nil
+			return
+		}
+		state := c.ConnectionState()
+		material, _ := exportEKM(state.ExportKeyingMaterial)
+		result <- material
+	}()
+	d := newTLSDialer("example.com", "", "", nil)
+	d.std.RootCAs = roots
+	_, material, err := d.handshake(ctx, client, "example.com:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(material) != 32 || !bytes.Equal(material, <-result) {
+		t.Fatal("direct CA-verified session has no shared channel binding")
+	}
+}
+
 func TestPinMismatch(t *testing.T) {
 	target := hashServer(t)
 	for _, fp := range []string{"", "chrome", "firefox", "360"} {
@@ -270,24 +310,23 @@ func TestTunnelRejectsBadKey(t *testing.T) {
 	}
 }
 
-func TestUDPCipher(t *testing.T) {
-	keys, _ := DeriveKeys(NewKey())
-	in, out := NewUDPCipher(keys, true), NewUDPCipher(keys, false)
-	msg := []byte("hello udp")
-	pkt := in.Seal(nil, 7, msg)
-	if len(pkt) != len(msg)+UDPOverhead {
-		t.Fatalf("overhead = %d", len(pkt)-len(msg))
-	}
-	id, pt, ok := out.Open(append([]byte{}, pkt...))
-	if !ok || id != 7 || !bytes.Equal(pt, msg) {
-		t.Fatal("c2s 解密失败")
-	}
-	if _, _, ok := in.Open(append([]byte{}, pkt...)); ok {
-		t.Fatal("方向密钥应当不同")
-	}
-	pkt[len(pkt)-1] ^= 1
-	if _, _, ok := out.Open(pkt); ok {
-		t.Fatal("篡改后不应通过校验")
+func TestNativeDatagramSizes(t *testing.T) {
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+	out, in := newDatagrams(a), newDatagrams(b)
+	for _, n := range []int{1, datagramChunk, datagramChunk + 1, 16384, 65507} {
+		payload := bytes.Repeat([]byte{0x51}, n)
+		done := make(chan error, 1)
+		go func() { _, err := out.Write(payload); done <- err }()
+		buf := make([]byte, 65535)
+		got, err := in.Read(buf)
+		if err != nil || !bytes.Equal(buf[:got], payload) {
+			t.Fatalf("size %d: got %d: %v", n, got, err)
+		}
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -629,7 +668,10 @@ func TestHTTPRecordIntegrity(t *testing.T) {
 		var nodeA, nodeB replayCache
 		srvA, wireA, etagA := handshake(&nodeA)
 		snA, _ := base64.RawURLEncoding.DecodeString(string(etagA))
-		rec := newHTTPConn(wireA, nil, keys, head, snA, true).appendRecord(nil, []byte("transfer 100"))
+		if len(snA) != 48 {
+			t.Fatal("missing server confirmation")
+		}
+		rec := newHTTPConn(wireA, nil, keys, head, snA[:16], true).appendRecord(nil, []byte("transfer 100"))
 		wireA.Write(rec)
 		buf := make([]byte, 64)
 		srvA.SetReadDeadline(time.Now().Add(3 * time.Second))

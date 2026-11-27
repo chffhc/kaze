@@ -37,7 +37,7 @@ func (s *Server) trafficSeries(userID int64) (hourly, daily []trafficPoint, err 
 		q += ` AND user_id=?`
 		args = append(args, userID)
 	}
-	rows, err := s.db.Query(q+` GROUP BY hour ORDER BY hour`, args...)
+	rows, err := s.reader().Query(q+` GROUP BY hour ORDER BY hour`, args...)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -141,11 +141,11 @@ func (s *Server) accessibleFrom(q dbq, all []*Group, u *User) []*Group {
 }
 
 func (s *Server) accessibleGroups(u *User) ([]*Group, error) {
-	all, err := listGroups(s.db)
+	all, err := listGroups(s.reader())
 	if err != nil {
 		return nil, err
 	}
-	return s.accessibleFrom(s.db, all, u), nil
+	return s.accessibleFrom(s.reader(), all, u), nil
 }
 
 func toGroupSet(all []*Group) groupSet {
@@ -157,20 +157,20 @@ func toGroupSet(all []*Group) groupSet {
 }
 
 func (s *Server) handleGroups(w http.ResponseWriter, r *http.Request, u *User) {
-	all, err := listGroups(s.db)
+	all, err := listGroups(s.reader())
 	if err != nil {
 		s.dbErr(w, err)
 		return
 	}
 	gs := toGroupSet(all)
-	nodes, err := listNodes(s.db, "")
+	nodes, err := listNodes(s.reader(), "")
 	if err != nil {
 		s.dbErr(w, err)
 		return
 	}
 	// 各入口组里的母规则 = 可供子规则挂载的共享 TLS 端口(暂停中的也列出,否则编辑挂在它下面的子规则时选不到原来的端口)
 	tlsPorts := map[int64][]tlsPortView{}
-	rows, err := s.db.Query(`SELECT in_group, listen_port, name || (CASE WHEN paused=1 THEN ',已暂停' ELSE '' END) FROM rules WHERE tls_mode='parent' ORDER BY listen_port`)
+	rows, err := s.reader().Query(`SELECT in_group, listen_port, name || (CASE WHEN paused=1 THEN ',已暂停' ELSE '' END) FROM rules WHERE tls_mode='parent' ORDER BY listen_port`)
 	if err != nil {
 		s.dbErr(w, err)
 		return
@@ -185,7 +185,7 @@ func (s *Server) handleGroups(w http.ResponseWriter, r *http.Request, u *User) {
 
 	online := s.hub.onlineCount()
 	out := []groupView{}
-	for _, g := range s.accessibleFrom(s.db, all, u) {
+	for _, g := range s.accessibleFrom(s.reader(), all, u) {
 		v := groupView{
 			ID: g.ID, Name: g.Name, Type: g.Type, Ratio: g.Ratio, Note: g.Note, Online: online[g.ID],
 			AllowedOut: g.Config.AllowedOut, Hosts: []string{}, TLSPorts: []tlsPortView{},
@@ -245,7 +245,7 @@ func (s *Server) handleNodeStatus(w http.ResponseWriter, r *http.Request, u *Use
 		s.dbErr(w, err)
 		return
 	}
-	nodes, err := listNodes(s.db, `WHERE last_seen>?`, now()-nodeRetention)
+	nodes, err := listNodes(s.reader(), `WHERE last_seen>?`, now()-nodeRetention)
 	if err != nil {
 		s.dbErr(w, err)
 		return
@@ -376,12 +376,7 @@ func normalizeALPN(in []string) ([]string, error) {
 }
 
 func suffixMatch(host string, list []string) bool {
-	for _, sfx := range list {
-		if sfx = strings.ToLower(strings.TrimSpace(sfx)); sfx != "" && strings.HasSuffix(host, sfx) {
-			return true
-		}
-	}
-	return false
+	return relay.MatchHostSuffix(host, list)
 }
 
 // prepareTLS 校验并规范化规则的 TLS 入站设置。old 为编辑时的原规则(用于沿用已保存的私钥)。
@@ -499,6 +494,21 @@ func (policy *rulePolicy) prepareRule(q dbq, actor, owner *User, in *ruleInput, 
 	}
 
 	// 端口
+	for _, target := range r.Targets {
+		host, port, err := net.SplitHostPort(target)
+		if err != nil || port != strconv.Itoa(r.ListenPort) {
+			continue
+		}
+		nodes, err := listNodes(q, "WHERE group_id=?", r.InGroup)
+		if err != nil {
+			return nil, err
+		}
+		for _, n := range nodes {
+			if strings.EqualFold(host, n.IP) || strings.EqualFold(host, advertisedHost(n.ConnectHost, n.IP)) {
+				return nil, errors.New("目标指向入口自身监听端口")
+			}
+		}
+	}
 	if err := policy.authorize(owner, r); err != nil {
 		return nil, err
 	}
@@ -676,12 +686,12 @@ func (s *Server) checkQuota(owner *User, adding int) error {
 }
 
 func (s *Server) handleRuleList(w http.ResponseWriter, r *http.Request, u *User) {
-	policy, err := loadRulePolicy(s.db)
+	policy, err := loadRulePolicy(s.reader())
 	if err != nil {
 		s.dbErr(w, err)
 		return
 	}
-	parents, err := policy.tlsParents(s.db)
+	parents, err := policy.tlsParents(s.reader())
 	if err != nil {
 		s.dbErr(w, err)
 		return
@@ -693,7 +703,7 @@ func (s *Server) handleRuleList(w http.ResponseWriter, r *http.Request, u *User)
 		q += ` WHERE r.user_id=?`
 		args = append(args, u.ID)
 	}
-	rows, err := s.db.Query(q+` ORDER BY r.id DESC`, args...)
+	rows, err := s.reader().Query(q+` ORDER BY r.id DESC`, args...)
 	if err != nil {
 		s.dbErr(w, err)
 		return
@@ -824,7 +834,7 @@ func (s *Server) dirtyRule(rules ...*Rule) {
 
 // ownedRule 读取规则并检查操作权限。
 func (s *Server) ownedRule(w http.ResponseWriter, r *http.Request, u *User) *Rule {
-	rule, err := getRule(s.db, pathID(r))
+	rule, err := getRule(s.reader(), pathID(r))
 	if err != nil {
 		s.dbErr(w, err)
 		return nil
@@ -925,7 +935,7 @@ func (s *Server) handleRuleDelete(w http.ResponseWriter, r *http.Request, u *Use
 		return
 	}
 	if old.TLSMode == proto.TLSModeParent {
-		if n := childCount(s.db, old.InGroup, old.ListenPort); n > 0 {
+		if n := childCount(s.reader(), old.InGroup, old.ListenPort); n > 0 {
 			s.fail(w, http.StatusConflict, fmt.Sprintf("这个共享 TLS 端口下还有 %d 条子规则,请先删除它们", n))
 			return
 		}
@@ -967,18 +977,18 @@ func (s *Server) handleRuleDiag(w http.ResponseWriter, r *http.Request, u *User)
 		s.ok(w, H{"hops": []proto.DiagHop{{From: "面板", To: "-", Error: "规则已暂停,恢复后才能诊断"}}})
 		return
 	}
-	owner, err := getUser(s.db, rule.UserID)
+	owner, err := getUser(s.reader(), rule.UserID)
 	if err != nil {
 		s.dbErr(w, err)
 		return
 	}
-	policy, err := loadRulePolicy(s.db)
+	policy, err := loadRulePolicy(s.reader())
 	if err != nil {
 		s.dbErr(w, err)
 		return
 	}
 	var withinQuota bool
-	if err := s.db.QueryRow(`SELECT `+ruleWithinQuotaSQL+` FROM rules r JOIN users u ON u.id=r.user_id WHERE r.id=?`, rule.ID).Scan(&withinQuota); err != nil {
+	if err := s.reader().QueryRow(`SELECT `+ruleWithinQuotaSQL+` FROM rules r JOIN users u ON u.id=r.user_id WHERE r.id=?`, rule.ID).Scan(&withinQuota); err != nil {
 		s.dbErr(w, err)
 		return
 	}
@@ -987,7 +997,7 @@ func (s *Server) handleRuleDiag(w http.ResponseWriter, r *http.Request, u *User)
 		return
 	}
 	if rule.TLSMode == proto.TLSModeChild {
-		parents, err := policy.tlsParents(s.db)
+		parents, err := policy.tlsParents(s.reader())
 		if err != nil {
 			s.dbErr(w, err)
 			return
@@ -1000,9 +1010,12 @@ func (s *Server) handleRuleDiag(w http.ResponseWriter, r *http.Request, u *User)
 	hops := s.hub.diag(rule)
 	if !u.IsAdmin() { // 普通用户不展示出口节点的真实地址
 		for i := range hops {
-			if strings.HasPrefix(hops[i].To, "出口 ") {
-				hops[i].To = "出口节点"
+			hops[i].From = "转发节点"
+			hops[i].To = "下一跳"
+			if hops[i].Error != "" {
+				hops[i].Error = "连接失败"
 			}
+
 		}
 	}
 	s.ok(w, H{"hops": hops})

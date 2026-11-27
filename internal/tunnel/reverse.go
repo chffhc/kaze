@@ -1,6 +1,7 @@
 package tunnel
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/rand"
@@ -159,17 +160,19 @@ func (l *ReverseListener) Port() int { return l.ln.Addr().(*net.TCPAddr).Port }
 
 // Update 热更新证书与允许拨入的出口组。被移出名单或密钥已更换的出口组,现有会话会被断开。
 func (l *ReverseListener) Update(cert *tls.Certificate, groups map[int64]*Keys) {
-	l.cert.Store(cert)
+
 	if groups == nil {
 		groups = map[int64]*Keys{}
 	}
 	var drop []*revSess
 	l.mu.Lock()
+	oldCert := l.cert.Swap(cert)
+	certChanged := oldCert == nil || cert == nil || !bytes.Equal(oldCert.Certificate[0], cert.Certificate[0])
 	l.groups = groups
 	for gid, list := range l.sess {
 		k := groups[gid]
 		for _, rs := range list {
-			if k == nil || !k.Equal(rs.keys) {
+			if certChanged || k == nil || !k.Equal(rs.keys) {
 				drop = append(drop, rs)
 			}
 		}
@@ -206,7 +209,7 @@ func (l *ReverseListener) warn(remote net.Addr, err error) {
 
 func (l *ReverseListener) handle(c net.Conn) {
 	l.mu.Lock()
-	if l.closed {
+	if l.closed || len(l.pend) >= 128 {
 		l.mu.Unlock()
 		c.Close()
 		return
@@ -225,7 +228,14 @@ func (l *ReverseListener) handle(c net.Conn) {
 	defer unpend()
 	defer c.Close()
 
-	tc := tls.Server(c, l.tlsCfg)
+	cert := l.cert.Load()
+	if cert == nil {
+		return
+	}
+	cfg := l.tlsCfg.Clone()
+	cfg.GetCertificate = nil
+	cfg.Certificates = []tls.Certificate{*cert}
+	tc := tls.Server(c, cfg)
 	ctx, cancel := context.WithTimeout(context.Background(), handshakeTimeout)
 	err := tc.HandshakeContext(ctx)
 	cancel()
@@ -233,7 +243,13 @@ func (l *ReverseListener) handle(c net.Conn) {
 		return
 	}
 	cs := tc.ConnectionState()
-	ekm := exportEKM(cs.ExportKeyingMaterial)
+	if !safeTLS(cs.Version, cs.CipherSuite) {
+		return
+	}
+	ekm, err := exportEKM(cs.ExportKeyingMaterial)
+	if err != nil {
+		return
+	}
 
 	var pre [revPrefaceLen]byte
 	tc.SetReadDeadline(time.Now().Add(handshakeTimeout))
@@ -266,7 +282,7 @@ func (l *ReverseListener) handle(c net.Conn) {
 	rs := &revSess{s: sess, keys: keys, remote: c.RemoteAddr().String(), limit: newRevLimit()}
 	l.mu.Lock()
 	// 握手期间名单可能已经变了
-	if cur := l.groups[gid]; l.closed || cur == nil || !cur.Equal(keys) {
+	if cur := l.groups[gid]; l.closed || l.cert.Load() == nil || !bytes.Equal(cert.Certificate[0], l.cert.Load().Certificate[0]) || len(l.sess[gid]) >= 64 || cur == nil || !cur.Equal(keys) {
 		l.mu.Unlock()
 		return
 	}

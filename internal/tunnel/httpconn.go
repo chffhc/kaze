@@ -2,6 +2,7 @@ package tunnel
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
@@ -67,22 +68,28 @@ func httpMAC(k *Keys, label string, parts ...[]byte) []byte {
 
 // newHTTPToken 生成请求头里的鉴权令牌,同时返回令牌头(会话密钥由它派生)。
 func newHTTPToken(k *Keys, flags byte, now time.Time) (token string, head []byte) {
+	return newHandshakeToken(k, flags, now, "auth")
+}
+func newHandshakeToken(k *Keys, flags byte, now time.Time, label string) (token string, head []byte) {
 	b := make([]byte, httpTokenHead, httpTokenLen)
 	b[0] = flags
 	binary.BigEndian.PutUint64(b[1:], uint64(now.UnixMilli()))
 	rand.Read(b[9:])
-	b = append(b, httpMAC(k, "auth", b)...)
+	b = append(b, httpMAC(k, label, b)...)
 	return base64.RawURLEncoding.EncodeToString(b), b[:httpTokenHead:httpTokenHead]
 }
 
 // verifyHTTPToken 校验令牌:HMAC、时间窗、随机数不重复。
 func verifyHTTPToken(token string, k *Keys, now time.Time, rc *replayCache) (flags byte, head []byte, err error) {
+	return verifyHandshakeToken(token, k, now, rc, "auth")
+}
+func verifyHandshakeToken(token string, k *Keys, now time.Time, rc *replayCache, label string) (flags byte, head []byte, err error) {
 	b, derr := base64.RawURLEncoding.DecodeString(token)
 	if derr != nil || len(b) != httpTokenLen {
 		return 0, nil, errAuth
 	}
 	head = b[:httpTokenHead:httpTokenHead]
-	if !hmac.Equal(b[httpTokenHead:], httpMAC(k, "auth", head)) {
+	if !hmac.Equal(b[httpTokenHead:], httpMAC(k, label, head)) {
 		return 0, nil, errAuth
 	}
 	ts := time.UnixMilli(int64(binary.BigEndian.Uint64(b[1:9])))
@@ -375,15 +382,15 @@ func dialHTTP(ctx context.Context, raw net.Conn, k *Keys, host, path string, fla
 	if err != nil {
 		return nil, fmt.Errorf("读取出口的响应头失败: %w", err)
 	}
-	if !strings.HasPrefix(first, "HTTP/1.1 200") {
+	if first != "HTTP/1.1 200 OK" {
 		return nil, errors.New("出口拒绝了隧道连接(密钥、路径不一致或时钟偏差过大): " + first)
 	}
 	snonce, err := base64.RawURLEncoding.DecodeString(strings.Trim(hdr["etag"], `"`))
-	if err != nil || len(snonce) != 16 {
+	if err != nil || len(snonce) != 16+sha256.Size || !hmac.Equal(snonce[16:], httpMAC(k, "server-confirm", head, snonce[:16])) {
 		return nil, errors.New("出口的响应头不完整")
 	}
 	raw.SetDeadline(time.Time{})
-	return newHTTPConn(raw, br, k, head, snonce, true), nil
+	return newHTTPConn(raw, br, k, head, snonce[:16], true), nil
 }
 
 // acceptHTTP 在出口侧处理一条新连接:读请求头、校验令牌、写响应头,返回加密连接与令牌里的 flags。
@@ -404,10 +411,18 @@ func acceptHTTP(raw net.Conn, k *Keys, path string, now time.Time, rc *replayCac
 		raw.Write(httpReject(http.StatusBadRequest, now))
 		return nil, 0, errHTTPMalformed
 	}
+	if f[2] == "HTTP/1.1" && hdr["host"] == "" {
+		raw.Write(httpReject(http.StatusBadRequest, now))
+		return nil, 0, errHTTPMalformed
+	}
 	target, _, _ := strings.Cut(f[1], "?")
 	token := cookieValue(hdr["cookie"], "sid")
 	if f[0] != http.MethodGet || target != path || token == "" {
-		raw.Write(httpReject(http.StatusNotFound, now))
+		reply := httpReject(http.StatusNotFound, now)
+		if f[0] == http.MethodHead {
+			reply = reply[:bytes.Index(reply, []byte("\r\n\r\n"))+4]
+		}
+		raw.Write(reply)
 		return nil, 0, errors.New("不是隧道请求")
 	}
 	flags, head, err := verifyHTTPToken(token, k, now, rc)
@@ -417,7 +432,7 @@ func acceptHTTP(raw net.Conn, k *Keys, path string, now time.Time, rc *replayCac
 	}
 	var snonce [16]byte
 	rand.Read(snonce[:])
-	if _, err := raw.Write(httpResponse(snonce[:], now)); err != nil {
+	if _, err := raw.Write(httpResponse(append(snonce[:], httpMAC(k, "server-confirm", head, snonce[:])...), now)); err != nil {
 		return nil, 0, err
 	}
 	raw.SetDeadline(time.Time{})

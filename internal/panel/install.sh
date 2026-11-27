@@ -157,6 +157,12 @@ panel_pattern='^https?://[][a-zA-Z0-9.:_~/%+-]+$'
 [[ $PANEL =~ $panel_pattern ]] || die '面板地址格式无效'
 [[ $TOKEN =~ ^[a-zA-Z0-9_-]+$ ]] || die '对接令牌格式无效'
 
+if [ "${OPTIMIZE:-0}" = "1" ]; then
+  trusted /etc/sysctl.d && [[ -d /etc/sysctl.d ]] || die 'sysctl 目录不安全'
+  conf=/etc/sysctl.d/99-kaze.conf
+  if exists "$conf"; then trusted_file "$conf" || die 'sysctl 配置文件归属异常'; fi
+fi
+
 case "$(uname -m)" in
   x86_64|amd64) ARCH=amd64 ;;
   aarch64|arm64) ARCH=arm64 ;;
@@ -196,7 +202,10 @@ unit_record "$UNIT" > "$MARK_TMP"
 mv -fT -- "$MARK_TMP" "$MARK"
 
 if [ "${OPTIMIZE:-0}" = "1" ]; then
-  cat > /etc/sysctl.d/99-kaze.conf <<EOT
+
+  conf_tmp=$(mktemp /etc/sysctl.d/.kaze.XXXXXXXX)
+  trap 'rm -f -- "$conf_tmp"' EXIT
+  cat > "$conf_tmp" <<EOT
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 net.core.somaxconn=65535
@@ -211,6 +220,9 @@ net.ipv4.tcp_wmem=4096 65536 33554432
 net.ipv4.tcp_mtu_probing=1
 fs.file-max=2097152
 EOT
+  chmod 644 "$conf_tmp"
+  mv -fT -- "$conf_tmp" "$conf"
+  trap - EXIT
   sysctl --system >/dev/null 2>&1 || true
   echo "已写入内核网络参数 /etc/sysctl.d/99-kaze.conf"
 fi

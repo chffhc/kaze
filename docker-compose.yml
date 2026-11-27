@@ -5,7 +5,8 @@ services:
     ports:
       - "127.0.0.1:8080:8080"   # 前面放 Caddy / Nginx 提供 HTTPS
     environment:
-      KAZE_TRUST_PROXY: "1"
+      KAZE_PROXY_CIDRS: "${KAZE_PROXY_CIDRS:-}"
+      KAZE_TRUST_PROXY: "${KAZE_TRUST_PROXY:-0}"
       # KAZE_ADMIN_PASS: "首次启动的管理员密码,不填则随机生成并打印在日志里"
     volumes:
       - ./data:/data

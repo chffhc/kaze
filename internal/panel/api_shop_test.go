@@ -15,7 +15,7 @@ func shopFixture(t *testing.T) *Server {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { db.Close() })
-	s := &Server{db: db, limiter: newIPLimiter(), settings: map[string]string{"epay_key": "local-test-only"}}
+	s := &Server{db: db, limiter: newIPLimiter(), settings: map[string]string{"epay_key": "local-test-only", "epay_pid": "fixture-merchant"}}
 	s.hub = newHub(s)
 	shopExec(t, s, `INSERT INTO users(id,username,password,balance,created_at) VALUES(1,'fixture','',17,0)`)
 	return s
@@ -41,7 +41,7 @@ func shopFault(t *testing.T, s *Server, event, action string) {
 	shopExec(t, s, `CREATE TRIGGER fixture_fault BEFORE `+event+` BEGIN SELECT RAISE(`+action+`); END`)
 }
 func notifyFixture(s *Server) *httptest.ResponseRecorder {
-	p := map[string]string{"out_trade_no": "fixture", "trade_no": "receipt", "trade_status": "TRADE_SUCCESS", "money": "1.25"}
+	p := map[string]string{"pid": "fixture-merchant", "out_trade_no": "fixture", "trade_no": "receipt", "trade_status": "TRADE_SUCCESS", "money": "1.25"}
 	q := url.Values{}
 	for k, v := range p {
 		q.Set(k, v)
