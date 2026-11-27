@@ -117,7 +117,7 @@ def main():
           and api("GET", "/api/me", token=user)["traffic_used"] >= me_before["traffic_used"])
     me = api("GET", "/api/me", token=user)
     check("套餐、余额、到期时间原样保留", all(me[k] == me_before[k] for k in ("plan_id", "balance", "expire_at", "traffic_quota", "max_rules")))
-    gs = {g["id"]: g for g in api("GET", "/api/admin/groups", token=admin)}
+    gs = {g["id"]: api("GET", f"/api/admin/groups/{g['id']}", token=admin) for g in api("GET", "/api/admin/groups", token=admin)}
     check("设备组配置原样保留(密钥、证书、故障转移组、黑名单)",
           gs[g_out["id"]]["config"]["tunnel_key"] == g_out["config"]["tunnel_key"]
           and gs[g_out["id"]]["config"]["cert_pin"] == g_out["config"]["cert_pin"]
@@ -144,10 +144,10 @@ def main():
 
     # 管理员升级后第一次打开设备组点"保存"(界面会把整份配置原样带回):不应让出口重启隧道、打断现有连接
     def resave(g):
-        cur = next(x for x in api("GET", "/api/admin/groups", token=admin) if x["id"] == g["id"])
+        cur = api("GET", f"/api/admin/groups/{g['id']}", token=admin)
         body = {k: cur[k] for k in ("name", "type", "ratio", "public", "sort", "note", "config")}
         api("PUT", f"/api/admin/groups/{g['id']}", body, admin)
-        return next(x for x in api("GET", "/api/admin/groups", token=admin) if x["id"] == g["id"])
+        return api("GET", f"/api/admin/groups/{g['id']}", token=admin)
 
     long_conn = env.hold(23002)
     saved = resave(g_out)

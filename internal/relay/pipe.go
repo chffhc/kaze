@@ -72,7 +72,7 @@ func (p *pipe) oneWay(dst, src net.Conn, ctr *atomic.Int64, lim [2]*Bucket, pref
 
 func (p *pipe) copy(dst, src net.Conn, ctr *atomic.Int64, lim [2]*Bucket, prefix []byte, ctx context.Context) error {
 	if len(prefix) > 0 {
-		if err := waitPipeLimits(ctx, lim, len(prefix)); err != nil {
+		if err := WaitLimits(ctx, lim, len(prefix)); err != nil {
 			return err
 		}
 		written, err := dst.Write(prefix)
@@ -103,7 +103,7 @@ func (p *pipe) copy(dst, src net.Conn, ctr *atomic.Int64, lim [2]*Bucket, prefix
 		}
 		n, rerr := src.Read(buf)
 		if n > 0 {
-			if err := waitPipeLimits(ctx, lim, n); err != nil {
+			if err := WaitLimits(ctx, lim, n); err != nil {
 				return err
 			}
 			written, werr := dst.Write(buf[:n])
@@ -121,7 +121,7 @@ func (p *pipe) copy(dst, src net.Conn, ctr *atomic.Int64, lim [2]*Bucket, prefix
 	}
 }
 
-func waitPipeLimits(ctx context.Context, lim [2]*Bucket, n int) error {
+func WaitLimits(ctx context.Context, lim [2]*Bucket, n int) error {
 	for _, bucket := range lim {
 		if err := bucket.wait(ctx, n); err != nil {
 			return err

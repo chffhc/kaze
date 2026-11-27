@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
@@ -115,13 +116,23 @@ func udpEcho(t *testing.T, addr string) {
 		t.Fatal(err)
 	}
 	defer c.Close()
-	buf := make([]byte, 2048)
+	buf := make([]byte, 65535)
 	for i := 0; i < 20; i++ {
-		msg := make([]byte, 100+i*60)
+		size := 100 + i*60
+		if i == 19 {
+			size = 16384
+			if runtime.GOOS == "darwin" {
+				// macOS defaults net.inet.udp.maxdgram to 9216; 9000 still exercises 4KB DTLS chunk reassembly.
+				size = 9000
+			}
+		}
+		msg := make([]byte, size)
 		rand.Read(msg)
 		var n int
 		for try := 0; try < 5; try++ { // 会话首包可能因异步建会话而稍有延迟
-			c.Write(msg)
+			if _, werr := c.Write(msg); werr != nil {
+				t.Fatalf("UDP 发送失败 #%d: %v", i, werr)
+			}
 			c.SetReadDeadline(time.Now().Add(time.Second))
 			if n, err = c.Read(buf); err == nil {
 				break

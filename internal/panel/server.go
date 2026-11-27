@@ -16,8 +16,9 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
+	"net/netip"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -35,6 +36,7 @@ type Options struct {
 	DistDir    string // 节点端二进制所在目录,供一键对接脚本下载
 	TLSCert    string // 可选:直接提供 HTTPS
 	TLSKey     string
+	ProxyCIDRs string
 	TrustProxy bool   // 信任反向代理传来的 X-Forwarded-For / X-Forwarded-Proto
 	AdminUser  string // 首次启动时创建的管理员
 	AdminPass  string
@@ -42,8 +44,10 @@ type Options struct {
 
 // Server 是面板服务。
 type Server struct {
+	proxies  []netip.Prefix
 	opt      Options
 	db       *sql.DB
+	reads    *sql.DB
 	hub      *Hub
 	secret   []byte
 	setMu    sync.RWMutex
@@ -51,6 +55,13 @@ type Server struct {
 	limiter  *ipLimiter
 	// ruleMu 串行化规则的创建、修改与删除:端口和 SNI 的占用检查要和随后的写入保持一致。
 	ruleMu sync.Mutex
+}
+
+func (s *Server) reader() *sql.DB {
+	if s.reads != nil {
+		return s.reads
+	}
+	return s.db
 }
 
 // H 是 JSON 对象的简写。
@@ -63,7 +74,26 @@ func Run(ctx context.Context, opt Options) error {
 		return err
 	}
 	defer db.Close()
-	s := &Server{opt: opt, db: db, settings: map[string]string{}, limiter: newIPLimiter()}
+	reads, err := sql.Open("sqlite", "file:"+filepath.ToSlash(filepath.Join(opt.DataDir, "kaze.db"))+"?mode=ro&_pragma=query_only(1)&_pragma=busy_timeout(8000)")
+	if err != nil {
+		return err
+	}
+	defer reads.Close()
+	db.SetMaxOpenConns(1)
+	reads.SetMaxOpenConns(8)
+	s := &Server{opt: opt, db: db, reads: reads, settings: map[string]string{}, limiter: newIPLimiter()}
+	if opt.TrustProxy {
+		for _, value := range strings.Split(opt.ProxyCIDRs, ",") {
+			if strings.TrimSpace(value) == "" {
+				continue
+			}
+			network, err := netip.ParsePrefix(strings.TrimSpace(value))
+			if err != nil {
+				return fmt.Errorf("无效的可信代理网段 %q: %w", value, err)
+			}
+			s.proxies = append(s.proxies, network)
+		}
+	}
 	if err := s.loadSettings(); err != nil {
 		return err
 	}
@@ -111,7 +141,7 @@ func (s *Server) bootstrap() error {
 	}
 	s.secret, _ = hex.DecodeString(sec)
 	var n int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&n); err != nil {
+	if err := s.reader().QueryRow(`SELECT COUNT(*) FROM users`).Scan(&n); err != nil {
 		return err
 	}
 	if n == 0 {
@@ -207,7 +237,7 @@ func (s *Server) parseToken(tok string) (*User, error) {
 	if _, err := fmt.Sscanf(tok[:i], "%d.%d.%d", &uid, &exp, &ver); err != nil || exp < now() {
 		return nil, errors.New("登录已过期")
 	}
-	u, err := getUser(s.db, uid)
+	u, err := getUser(s.reader(), uid)
 	if err != nil || u.tokenVer != ver {
 		return nil, errors.New("登录已失效")
 	}
@@ -255,20 +285,50 @@ func pathID(r *http.Request) int64 {
 	return id
 }
 
-func (s *Server) clientIP(r *http.Request) string {
-	if s.opt.TrustProxy {
-		if v := r.Header.Get("X-Real-IP"); v != "" {
-			return strings.TrimSpace(v)
-		}
-		if v := r.Header.Get("X-Forwarded-For"); v != "" {
-			return strings.TrimSpace(strings.Split(v, ",")[0])
+func (s *Server) trustedProxy(r *http.Request) bool {
+	peer, err := netip.ParseAddrPort(r.RemoteAddr)
+	return err == nil && s.trustedProxyAddr(peer.Addr())
+}
+
+func (s *Server) trustedProxyAddr(addr netip.Addr) bool {
+	if !s.opt.TrustProxy || addr.Zone() != "" {
+		return false
+	}
+	addr = addr.Unmap()
+	if len(s.proxies) == 0 {
+		return addr.IsLoopback()
+	}
+	for _, p := range s.proxies {
+		if p.Contains(addr) {
+			return true
 		}
 	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	return false
+}
+
+func (s *Server) clientIP(r *http.Request) string {
+	peer, err := netip.ParseAddrPort(r.RemoteAddr)
 	if err != nil {
 		return r.RemoteAddr
 	}
-	return host
+	addr := peer.Addr().Unmap()
+	lines := r.Header.Values("X-Forwarded-For")
+	for i := len(lines) - 1; i >= 0 && s.trustedProxyAddr(addr); i-- {
+		line := lines[i]
+		for s.trustedProxyAddr(addr) {
+			comma := strings.LastIndexByte(line, ',')
+			next, err := netip.ParseAddr(strings.TrimSpace(line[comma+1:]))
+			if err != nil || next.Zone() != "" {
+				return addr.String()
+			}
+			addr = next.Unmap()
+			if comma == -1 {
+				break
+			}
+			line = line[:comma]
+		}
+	}
+	return addr.String()
 }
 
 // baseURL 返回面板的对外地址:优先用设置里的 panel_url,否则从请求推断。
@@ -280,12 +340,31 @@ func (s *Server) baseURL(r *http.Request) string {
 	if r.TLS != nil {
 		scheme = "https"
 	}
-	if s.opt.TrustProxy {
-		if v := r.Header.Get("X-Forwarded-Proto"); v != "" {
+	if s.trustedProxy(r) {
+		if v := r.Header.Get("X-Forwarded-Proto"); v == "http" || v == "https" {
 			scheme = v
 		}
 	}
 	return scheme + "://" + r.Host
+}
+
+func validBaseURL(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return false
+	}
+	if value := u.Port(); value != "" {
+		port, err := strconv.Atoi(value)
+		if err != nil || port < 1 || port > 65535 {
+			return false
+		}
+	}
+	for _, c := range raw {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || strings.ContainsRune(":/[]_.~%+-", c)) {
+			return false
+		}
+	}
+	return true
 }
 
 type handler func(w http.ResponseWriter, r *http.Request, u *User)
@@ -322,12 +401,13 @@ func (s *Server) admin(next handler) http.HandlerFunc {
 
 // ipLimiter 是按 key 的固定窗口限流器(登录、注册、用户写操作)。
 type ipLimiter struct {
-	mu sync.Mutex
-	m  map[string]*window
+	nextCleanup time.Time
+	mu          sync.Mutex
+	m           map[string]*window
 }
 
 type window struct {
-	start time.Time
+	until time.Time
 	n     int
 }
 
@@ -337,16 +417,20 @@ func (l *ipLimiter) allow(key string, limit int, per time.Duration) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	t := time.Now()
-	if len(l.m) > 50000 { // 防止被大量来源撑爆
+	if !t.Before(l.nextCleanup) {
+		l.nextCleanup = t.Add(time.Minute) // 防止被大量来源撑爆
 		for k, w := range l.m {
-			if t.Sub(w.start) > time.Minute {
+			if !t.Before(w.until) {
 				delete(l.m, k)
 			}
 		}
 	}
 	w := l.m[key]
-	if w == nil || t.Sub(w.start) > per {
-		l.m[key] = &window{start: t, n: 1}
+	if w == nil && len(l.m) >= 50000 {
+		return false
+	}
+	if w == nil || !t.Before(w.until) {
+		l.m[key] = &window{until: t.Add(per), n: 1}
 		return true
 	}
 	w.n++
@@ -420,6 +504,7 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("POST /api/admin/users", s.admin(s.handleAdminUserCreate))
 	mux.HandleFunc("PUT /api/admin/users/{id}", s.admin(s.handleAdminUserUpdate))
 	mux.HandleFunc("DELETE /api/admin/users/{id}", s.admin(s.handleAdminUserDelete))
+	mux.HandleFunc("GET /api/admin/groups/{id}", s.admin(s.handleAdminGroupDetails))
 	mux.HandleFunc("GET /api/admin/groups", s.admin(s.handleAdminGroups))
 	mux.HandleFunc("POST /api/admin/groups", s.admin(s.handleAdminGroupCreate))
 	mux.HandleFunc("PUT /api/admin/groups/{id}", s.admin(s.handleAdminGroupUpdate))
@@ -470,7 +555,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, 400, err.Error())
 		return
 	}
-	u, err := scanUser(s.db.QueryRow(`SELECT `+userCols+` FROM users u WHERE u.username=?`, strings.TrimSpace(in.Username)))
+	u, err := scanUser(s.reader().QueryRow(`SELECT `+userCols+` FROM users u WHERE u.username=?`, strings.TrimSpace(in.Username)))
 	if err != nil || !checkPassword(u.password, in.Password) {
 		s.fail(w, http.StatusUnauthorized, "用户名或密码错误")
 		return
@@ -524,7 +609,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id, _ := res.LastInsertId()
-	u, err := getUser(s.db, id)
+	u, err := getUser(s.reader(), id)
 	if err != nil {
 		s.dbErr(w, err)
 		return

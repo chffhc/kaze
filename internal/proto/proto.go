@@ -6,10 +6,13 @@
 //	节点 -> 面板: report(流量增量) / metrics(探针) / status(规则同步状态) / diag_result
 package proto
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"net/netip"
+)
 
 // Version 是面板与节点共用的版本号。
-const Version = "1.1.0"
+const Version = "1.1.1"
 
 // 消息类型
 const (
@@ -68,6 +71,7 @@ type Hello struct {
 
 // TunnelSpec 描述入口如何连接某个出口组。
 type TunnelSpec struct {
+	CDN        bool        `json:"cdn,omitempty"`
 	GroupID    int64       `json:"group_id"`
 	Endpoints  []string    `json:"endpoints"`          // 出口节点地址 host:port
 	Transport  string      `json:"transport"`          // tcp | tls | ws | wss | http
@@ -82,7 +86,7 @@ type TunnelSpec struct {
 	Fallback   *TunnelSpec `json:"fallback,omitempty"` // 故障转移组
 
 	// Fingerprint 让 tls / wss 的 ClientHello 模拟指定浏览器(utls):
-	// chrome / firefox / safari / ios / android / edge / 360 / qq;为空则使用 Go 自身的握手特征。
+	// chrome / firefox / safari / ios / edge / qq;为空则使用 Go 自身的握手特征。
 	Fingerprint string `json:"fp,omitempty"`
 	// Reverse 表示这条隧道由出口主动拨入(反向隧道):入口不再连接 Endpoints,而是在出口保持的连接上开流。
 	Reverse bool `json:"reverse,omitempty"`
@@ -105,17 +109,18 @@ type OriginTLS struct {
 
 // Rule 是下发给入口节点的一条转发规则。
 type Rule struct {
-	ID            int64    `json:"id"`
-	UserID        int64    `json:"uid"`
-	ListenPort    int      `json:"port"`
-	Proto         string   `json:"proto"`   // tcp | udp | tcp+udp
-	OutGroup      int64    `json:"out"`     // 0 = 入口直出
-	Targets       []string `json:"targets"` // 仅直出时由入口使用
-	LB            string   `json:"lb"`      // round_robin | random | least_conn | ip_hash | failover
-	ProxyProtocol int      `json:"pp"`      // 0 关闭 / 1 / 2
-	SpeedLimit    int64    `json:"speed"`   // 规则级限速,字节/秒,0 不限
-	ConnLimit     int      `json:"conns"`   // 规则级连接数限制
-	IPLimit       int      `json:"ips"`     // 规则级 IP 数限制
+	ExcludedTargets []netip.AddrPort `json:"excluded_targets,omitempty"`
+	ID              int64            `json:"id"`
+	UserID          int64            `json:"uid"`
+	ListenPort      int              `json:"port"`
+	Proto           string           `json:"proto"`   // tcp | udp | tcp+udp
+	OutGroup        int64            `json:"out"`     // 0 = 入口直出
+	Targets         []string         `json:"targets"` // 仅直出时由入口使用
+	LB              string           `json:"lb"`      // round_robin | random | least_conn | ip_hash | failover
+	ProxyProtocol   int              `json:"pp"`      // 0 关闭 / 1 / 2
+	SpeedLimit      int64            `json:"speed"`   // 规则级限速,字节/秒,0 不限
+	ConnLimit       int              `json:"conns"`   // 规则级连接数限制
+	IPLimit         int              `json:"ips"`     // 规则级 IP 数限制
 
 	TLS              *TLSInbound `json:"tls,omitempty"`               // TLS 入站;子规则的 ListenPort 是母规则的端口
 	OriginTLS        *OriginTLS  `json:"origin_tls,omitempty"`        // 回源 TLS:直出时由入口执行;经隧道时由最后一跳执行,入口只据此决定是否传递 ALPN
@@ -165,10 +170,11 @@ type ReverseSpec struct {
 
 // OutRule 是下发给出口节点的规则(出口负责连接目标)。
 type OutRule struct {
-	ID            int64    `json:"id"`
-	Targets       []string `json:"targets"`
-	LB            string   `json:"lb"`
-	ProxyProtocol int      `json:"pp"`
+	ExcludedTargets []netip.AddrPort `json:"excluded_targets,omitempty"`
+	ID              int64            `json:"id"`
+	Targets         []string         `json:"targets"`
+	LB              string           `json:"lb"`
+	ProxyProtocol   int              `json:"pp"`
 
 	Next      int64      `json:"next,omitempty"`       // 链式出口:非 0 时本跳不连接目标,而是把流转给 Tunnels[Next]
 	OriginTLS *OriginTLS `json:"origin_tls,omitempty"` // 连接目标时再套一层 TLS

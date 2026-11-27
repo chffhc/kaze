@@ -3,6 +3,10 @@ package panel
 import (
 	"errors"
 	"fmt"
+	"net"
+	"net/netip"
+	"strconv"
+	"strings"
 
 	"kaze/internal/proto"
 )
@@ -10,9 +14,35 @@ import (
 // The same owner policy is applied to proposed rules and to copies of stored
 // rules. Never persist a runtime rejection as a manual pause.
 type rulePolicy struct {
-	all    []*Group
-	groups groupSet
-	plans  map[int64][]int64
+	nodeIPs map[int64][]netip.Addr
+	all     []*Group
+	groups  groupSet
+	plans   map[int64][]int64
+}
+
+// Only rules targeting their own listen port need advertised addresses at dial time.
+func (p *rulePolicy) loopTargets(r *Rule) []netip.AddrPort {
+	for _, t := range r.Targets {
+		_, port, err := net.SplitHostPort(t)
+		if err != nil {
+			continue
+		}
+		num, e := strconv.Atoi(port)
+		if e != nil || num != r.ListenPort {
+			continue
+		}
+		var blocked []netip.AddrPort
+		if g := p.groups[r.InGroup]; g != nil {
+			if ip, e := netip.ParseAddr(g.Config.DisplayHost); e == nil {
+				blocked = append(blocked, netip.AddrPortFrom(ip.Unmap(), uint16(num)))
+			}
+		}
+		for _, ip := range p.nodeIPs[r.InGroup] {
+			blocked = append(blocked, netip.AddrPortFrom(ip, uint16(num)))
+		}
+		return blocked
+	}
+	return nil
 }
 
 func loadRulePolicy(q dbq) (*rulePolicy, error) {
@@ -44,6 +74,14 @@ func (p *rulePolicy) authorize(owner *User, r *Rule) error {
 	ig := p.groups[r.InGroup]
 	if !allowed(ig, proto.RoleIn) {
 		return errors.New("入口组不存在或无权使用")
+	}
+	if ig.Config.DisplayHost != "" {
+		for _, target := range r.Targets {
+			host, port, err := net.SplitHostPort(target)
+			if err == nil && port == strconv.Itoa(r.ListenPort) && strings.EqualFold(strings.TrimSuffix(host, "."), strings.TrimSuffix(ig.Config.DisplayHost, ".")) {
+				return errors.New("目标指向入口自身监听端口")
+			}
+		}
 	}
 	if !owner.IsAdmin() && r.TLSMode != proto.TLSModeChild && r.ListenPort != 0 && !portInRange(rulePortRanges(ig), r.ListenPort) {
 		return fmt.Errorf("监听端口需在 %s 范围内", ig.Config.PortRange)

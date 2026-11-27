@@ -23,7 +23,7 @@ func (s *Server) jobs(ctx context.Context) {
 			s.autoRenew(t)
 			// 这段时间内刚到期的用户:重新下发配置以停掉其规则
 			var n int
-			s.db.QueryRow(`SELECT COUNT(*) FROM users WHERE expire_at>? AND expire_at<=?`, last, t).Scan(&n)
+			s.reader().QueryRow(`SELECT COUNT(*) FROM users WHERE expire_at>? AND expire_at<=?`, last, t).Scan(&n)
 			if n > 0 {
 				s.hub.Dirty()
 			}
@@ -37,8 +37,8 @@ func (s *Server) jobs(ctx context.Context) {
 // autoRenew 为已到期、开启了自动续费且余额足够的用户续费原套餐。
 // 余额不足的用户会在之后充值到账时被自动续上。
 func (s *Server) autoRenew(t int64) {
-	rows, err := s.db.Query(`SELECT u.id, u.plan_id FROM users u JOIN plans p ON p.id=u.plan_id
-		WHERE u.auto_renew=1 AND u.banned=0 AND u.expire_at>0 AND u.expire_at<=? AND u.balance>=p.price`, t)
+	rows, err := s.reader().Query(`SELECT u.id, u.plan_id FROM users u JOIN plans p ON p.id=u.plan_id
+		WHERE p.hidden=0 AND u.auto_renew=1 AND u.banned=0 AND u.expire_at>0 AND u.expire_at<=? AND u.balance>=p.price`, t)
 	if err != nil {
 		return
 	}

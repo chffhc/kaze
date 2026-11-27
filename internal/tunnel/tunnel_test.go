@@ -6,6 +6,8 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"fmt"
 	"io"
@@ -232,6 +234,44 @@ func TestFingerprintChangesClientHello(t *testing.T) {
 	}
 }
 
+func TestCAAuthenticatedTLSChannelBinding(t *testing.T) {
+	pem, key, _, err := GenerateCert("example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := ParseCert(pem, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots := x509.NewCertPool()
+	roots.AddCert(cert.Leaf)
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	result := make(chan []byte, 1)
+	go func() {
+		c := tls.Server(server, &tls.Config{Certificates: []tls.Certificate{cert}})
+		if err := c.HandshakeContext(ctx); err != nil {
+			result <- nil
+			return
+		}
+		state := c.ConnectionState()
+		material, _ := exportEKM(state.Version, state.ExportKeyingMaterial)
+		result <- material
+	}()
+	d := newTLSDialer("example.com", "", "", nil)
+	d.std.RootCAs = roots
+	_, material, err := d.handshake(ctx, client, "example.com:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(material) != 32 || !bytes.Equal(material, <-result) {
+		t.Fatal("direct CA-verified session has no shared channel binding")
+	}
+}
+
 func TestPinMismatch(t *testing.T) {
 	target := hashServer(t)
 	for _, fp := range []string{"", "chrome", "firefox", "360"} {
@@ -270,24 +310,25 @@ func TestTunnelRejectsBadKey(t *testing.T) {
 	}
 }
 
-func TestUDPCipher(t *testing.T) {
-	keys, _ := DeriveKeys(NewKey())
-	in, out := NewUDPCipher(keys, true), NewUDPCipher(keys, false)
-	msg := []byte("hello udp")
-	pkt := in.Seal(nil, 7, msg)
-	if len(pkt) != len(msg)+UDPOverhead {
-		t.Fatalf("overhead = %d", len(pkt)-len(msg))
-	}
-	id, pt, ok := out.Open(append([]byte{}, pkt...))
-	if !ok || id != 7 || !bytes.Equal(pt, msg) {
-		t.Fatal("c2s 解密失败")
-	}
-	if _, _, ok := in.Open(append([]byte{}, pkt...)); ok {
-		t.Fatal("方向密钥应当不同")
-	}
-	pkt[len(pkt)-1] ^= 1
-	if _, _, ok := out.Open(pkt); ok {
-		t.Fatal("篡改后不应通过校验")
+func TestNativeDatagramSizes(t *testing.T) {
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+	out, in := newDatagrams(a, nativeSessionLifetime), newDatagrams(b, nativeSessionLifetime)
+	defer out.Close()
+	defer in.Close()
+	for _, n := range []int{1, datagramChunk, datagramChunk + 1, 16384, 65507} {
+		payload := bytes.Repeat([]byte{0x51}, n)
+		done := make(chan error, 1)
+		go func() { _, err := out.Write(payload); done <- err }()
+		buf := make([]byte, 65535)
+		got, err := in.Read(buf)
+		if err != nil || !bytes.Equal(buf[:got], payload) {
+			t.Fatalf("size %d: got %d: %v", n, got, err)
+		}
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -629,7 +670,10 @@ func TestHTTPRecordIntegrity(t *testing.T) {
 		var nodeA, nodeB replayCache
 		srvA, wireA, etagA := handshake(&nodeA)
 		snA, _ := base64.RawURLEncoding.DecodeString(string(etagA))
-		rec := newHTTPConn(wireA, nil, keys, head, snA, true).appendRecord(nil, []byte("transfer 100"))
+		if len(snA) != 48 {
+			t.Fatal("missing server confirmation")
+		}
+		rec := newHTTPConn(wireA, nil, keys, head, snA[:16], true).appendRecord(nil, []byte("transfer 100"))
 		wireA.Write(rec)
 		buf := make([]byte, 64)
 		srvA.SetReadDeadline(time.Now().Add(3 * time.Second))
@@ -666,7 +710,7 @@ type revEnv struct {
 
 func startReverse(t *testing.T, target string, groups ...int64) *revEnv {
 	t.Helper()
-	ln, err := NewReverseListener("127.0.0.1", 0, nil)
+	ln, err := NewReverseListener("127.0.0.1", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -862,5 +906,97 @@ func TestMuxRejectsStreamsFromServerSide(t *testing.T) {
 	}
 	if n := entry.NumStreams(); n != 0 {
 		t.Fatalf("入口这边不应留下任何流: %d", n)
+	}
+}
+
+func TestTunnelTLS12Rejected(t *testing.T) {
+	cp, kp, pin, err := GenerateCert("example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := ParseCert(cp, kp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := &tls.Config{Certificates: []tls.Certificate{cert}, MaxVersion: tls.VersionTLS12}
+	for _, fp := range append([]string{"", "360", "android"}, Fingerprints()...) {
+		t.Run("dial/"+fp, func(t *testing.T) {
+			raw, server := net.Pipe()
+			defer raw.Close()
+			defer server.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			go tls.Server(server, legacy).HandshakeContext(ctx)
+			_, _, err := newTLSDialer("example.com", pin, fp, nil).handshake(ctx, raw, "example.com:443")
+			if err == nil || ctx.Err() != nil {
+				t.Fatalf("expected TLS version rejection, got %v", err)
+			}
+		})
+	}
+	rejectLegacyClient := func(port int) {
+		t.Helper()
+		roots := x509.NewCertPool()
+		roots.AddCert(cert.Leaf)
+		cfg := &tls.Config{RootCAs: roots, ServerName: "example.com", MaxVersion: tls.VersionTLS12}
+		conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 3 * time.Second}, "tcp", fmt.Sprintf("127.0.0.1:%d", port), cfg)
+		if err == nil {
+			conn.Close()
+			t.Fatal("listener accepted TLS 1.2")
+		}
+	}
+	for _, tr := range []string{TransportTLS, TransportWSS} {
+		s, err := NewServer(ServerConfig{Bind: "127.0.0.1", Transport: tr, Cert: &cert}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rejectLegacyClient(s.Port())
+		s.Close()
+	}
+	l, err := NewReverseListener("127.0.0.1", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	l.Update(&cert, nil)
+	rejectLegacyClient(l.Port())
+}
+
+func TestRequiredChannelBinding(t *testing.T) {
+	for _, n := range []int{0, 1, ekmSize - 1, ekmSize + 1} {
+		if _, err := exportEKM(tls.VersionTLS13, func(string, []byte, int) ([]byte, error) { return make([]byte, n), nil }); err == nil {
+			t.Fatalf("accepted %d exporter bytes", n)
+		}
+	}
+	k, err := DeriveKeys(NewKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, material := range [][]byte{nil, {1}} {
+		preface := appendRevPreface(nil, k, 1, material, time.Now())
+		if verifyRevPreface(preface, k, material) == nil {
+			t.Fatal("accepted reverse session without a full channel binding")
+		}
+	}
+}
+
+func TestNativeSessionKeyExpiry(t *testing.T) {
+	a, b := net.Pipe()
+	defer b.Close()
+	d := newDatagrams(a, 20*time.Millisecond)
+	defer d.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := d.SetReadDeadline(time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { _, err := d.Read(make([]byte, 32)); done <- err }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("read survived session expiry")
+		}
+	case <-ctx.Done():
+		t.Fatal("idle deadline extended key lifetime")
 	}
 }

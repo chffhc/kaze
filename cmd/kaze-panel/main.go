@@ -29,6 +29,7 @@ func main() {
 	flag.StringVar(&o.DistDir, "dist", env("KAZE_DIST", "./dist"), "节点端二进制目录(供一键对接脚本下载)")
 	flag.StringVar(&o.TLSCert, "tls-cert", env("KAZE_TLS_CERT", ""), "TLS 证书文件(不填则监听 HTTP,建议前置 Caddy/Nginx 提供 HTTPS)")
 	flag.StringVar(&o.TLSKey, "tls-key", env("KAZE_TLS_KEY", ""), "TLS 私钥文件")
+	flag.StringVar(&o.ProxyCIDRs, "proxy-cidrs", env("KAZE_PROXY_CIDRS", ""), "可信反向代理 CIDR，逗号分隔，默认仅本机回环")
 	flag.BoolVar(&o.TrustProxy, "trust-proxy", env("KAZE_TRUST_PROXY", "") == "1", "信任反向代理的 X-Forwarded-For / X-Forwarded-Proto(仅在面板位于反向代理之后时开启)")
 	flag.StringVar(&o.AdminUser, "admin-user", env("KAZE_ADMIN_USER", "admin"), "首次启动时创建的管理员用户名")
 	flag.StringVar(&o.AdminPass, "admin-pass", env("KAZE_ADMIN_PASS", ""), "首次启动时的管理员密码(不填则随机生成并打印)")

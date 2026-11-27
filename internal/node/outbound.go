@@ -26,7 +26,7 @@ type outbound struct {
 
 	mu    sync.Mutex
 	srv   *tunnel.Server
-	udp   *relay.UDPRelay
+	udp   *tunnel.NativeListener
 	ident string // 监听参数指纹,变化时重启服务端
 	port  int
 	revs  map[string]*revEntry // 入口节点的反向端口地址 -> 拨号器
@@ -134,22 +134,11 @@ func (o *outbound) apply(cfg *proto.OutboundConfig, groupID int64) error {
 
 	// 原生 UDP 通道与隧道共用同一个端口号
 	ua := &net.UDPAddr{IP: net.ParseIP(o.a.opt.Bind), Port: o.port}
-	if uc, err := net.ListenUDP("udp", ua); err != nil {
-		log.Printf("[出口] 原生 UDP 通道监听失败(UDP 仅能走 udp_over_tcp): %v", err)
+	listener, err := tunnel.ListenNativeUDP(ua, keys, o.openUDP)
+	if err != nil {
+		log.Printf("[出口] 原生 UDP 通道监听失败: %v", err)
 	} else {
-		uc.SetReadBuffer(4 << 20)
-		uc.SetWriteBuffer(4 << 20)
-		ciph := tunnel.NewUDPCipher(keys, false)
-		o.udp = &relay.UDPRelay{
-			Conn: uc,
-			Decode: func(pkt []byte) ([]byte, uint32, bool) {
-				id, pt, ok := ciph.Open(pkt)
-				return pt, id, ok
-			},
-			Encode: func(dst, payload []byte) []byte { return ciph.Seal(dst, 0, payload) },
-			Open:   o.openUDP,
-		}
-		go o.udp.Serve()
+		o.udp = listener
 	}
 	if o.a.state.TunnelPort != o.port {
 		o.a.state.TunnelPort = o.port
@@ -235,7 +224,7 @@ func (o *outbound) handle(conn net.Conn, h tunnel.StreamHeader) {
 		return
 	}
 	defer rule.live.forget(conn)
-	ctx, cancel := context.WithTimeout(rule.live.ctx, connectTimeout)
+	ctx, cancel := context.WithTimeout(relay.WithExcludedTargets(rule.live.ctx, 0, rule.spec.ExcludedTargets), connectTimeout)
 	defer cancel()
 
 	// 链式出口的中间跳:原样把流头转给下一跳。UDP 流的封装格式各跳相同,同样按字节转发即可。
@@ -305,7 +294,7 @@ func (o *outbound) openUDP(client netip.AddrPort, ruleID uint32) (relay.Upstream
 	if rule == nil {
 		return nil, fmt.Errorf("规则 #%d 不存在", ruleID)
 	}
-	ctx, cancel := context.WithTimeout(rule.live.ctx, connectTimeout)
+	ctx, cancel := context.WithTimeout(relay.WithExcludedTargets(rule.live.ctx, 0, rule.spec.ExcludedTargets), connectTimeout)
 	defer cancel()
 	if rule.spec.Next != 0 { // 链式出口:后续各跳一律走隧道流
 		cli := o.tunnels.get(rule.spec.Next)

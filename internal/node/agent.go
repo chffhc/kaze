@@ -136,20 +136,20 @@ func Run(ctx context.Context, opt Options) (runErr error) {
 	if d != nil {
 		var err error
 		owner := trafficOwner(opt, a.state.UID)
-		if a.state.ConfigOwner != "" && a.state.ConfigOwner != owner {
+		clearCachedConfig := func() error {
+			if a.state.LastConfig == nil {
+				return nil
+			}
 			a.state.LastConfig = nil
-			if err := a.saveState(); err != nil {
+			return a.saveState()
+		}
+		if a.state.ConfigOwner != "" && a.state.ConfigOwner != owner {
+			if err := clearCachedConfig(); err != nil {
 				return err
 			}
 		}
-		a.traffic, err = loadTraffic(opt, a.state.UID, d)
+		a.traffic, err = loadTraffic(opt, a.state.UID, d, clearCachedConfig)
 		if err != nil {
-			return err
-		}
-	}
-	if a.traffic != nil && a.traffic.rebound {
-		a.state.LastConfig = nil
-		if err := a.saveState(); err != nil {
 			return err
 		}
 	}

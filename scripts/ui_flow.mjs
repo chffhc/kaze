@@ -40,7 +40,7 @@ try {
   await api('POST', '/api/rules', { in_group: gin.id, tls_mode: 'parent', listen_port: 8443 }, adm);
   const site = await api('POST', '/api/rules', { name: '网站', in_group: gin.id, out_group: ghttp.id, listen_port: 9443, targets: ['10.0.0.1:443', '10.0.0.2:443'], lb: 'failover',
     proxy_protocol: 2, tls_mode: 'tls', tls: { sni: ['www.example.com'], alpn: ['h2', 'http/1.1'], origin_tls: true, origin_sni: 'origin.internal', origin_verify: true } }, alice);
-  const groups = async () => Object.fromEntries((await api('GET', '/api/admin/groups', null, adm)).map(g => [g.id, g]));
+  const groups = async () => Object.fromEntries(await Promise.all((await api('GET', '/api/admin/groups', null, adm)).map(async g => [g.id, await api('GET', '/api/admin/groups/' + g.id, null, adm)])));
   const rules = async () => await api('GET', '/api/rules', null, alice);
 
   const browser = await chromium.launch();

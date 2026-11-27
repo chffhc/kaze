@@ -236,7 +236,7 @@ func TestHTTPAndFingerprintForward(t *testing.T) {
 		{tunnel.TransportTLS, true, "chrome"},
 		{tunnel.TransportTLS, false, "firefox"},
 		{tunnel.TransportWSS, true, "safari"},
-		{tunnel.TransportTLS, true, "360"}, // 协商到 TLS 1.2:鉴权退回时间戳校验
+		{tunnel.TransportTLS, true, "360"}, // 历史 360 配置使用标准 TLS 与通道绑定
 	}
 	for _, c := range cases {
 		t.Run(fmt.Sprintf("%s/mux=%v/fp=%s", c.transport, c.mux, c.fp), func(t *testing.T) {
@@ -808,5 +808,54 @@ func TestStreamHeaderALPNOnlyForOriginTLS(t *testing.T) {
 			t.Fatal("出口没有收到流")
 		}
 		c.Close()
+	}
+}
+
+func TestTLSInboundHTTP2WithPolicy(t *testing.T) {
+	target := echoServer(t)
+	p := freePort(t)
+	cfg := &proto.InboundConfig{
+		AllowPrivate: true,
+		AllowedHosts: []string{".example.com"},
+		BlockedHosts: []string{"bad.example.com"},
+		Rules: []proto.Rule{{
+			ID: 1, UserID: 1, ListenPort: p, Proto: "tcp", Targets: []string{target},
+			TLS: &proto.TLSInbound{Mode: proto.TLSModeAlone, ALPN: []string{"h2", "http/1.1"}},
+		}},
+	}
+	in := startIn(t, cfg)
+	addr := fmt.Sprintf("127.0.0.1:%d", p)
+	c, err := tlsClient(addr, "app.example.com", []string{"h2"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const h2Stream = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\nPING"
+	if _, err := io.WriteString(c, h2Stream); err != nil {
+		c.Close()
+		t.Fatal(err)
+	}
+	_ = c.CloseWrite()
+	c.SetReadDeadline(time.Now().Add(3 * time.Second))
+	got, err := io.ReadAll(c)
+	c.Close()
+	if err != nil || string(got) != h2Stream {
+		t.Fatalf("TLS h2 under host policy failed: err=%v got=%q", err, got)
+	}
+
+	cfg.BlockedProtocols = []string{"http"}
+	if err := in.applyConfig(&proto.NodeConfig{Role: proto.RoleIn, Inbound: cfg}, false); err != nil {
+		t.Fatal(err)
+	}
+	c2, err := tlsClient(addr, "app.example.com", []string{"h2"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.WriteString(c2, h2Stream)
+	c2.SetReadDeadline(time.Now().Add(3 * time.Second))
+	buf := make([]byte, 32)
+	n, _ := c2.Read(buf)
+	c2.Close()
+	if n != 0 {
+		t.Fatalf("TLS h2 should be rejected when http is blocked, got %q", buf[:n])
 	}
 }

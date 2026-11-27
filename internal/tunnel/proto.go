@@ -3,7 +3,7 @@
 //	传输层   tcp(明文,专线用) / tls / ws / wss / http(伪 HTTP 头 + 加密记录流)
 //	鉴权     连接前导帧 = HMAC-SHA256(预共享密钥, 时间戳 | 随机数 | TLS 导出密钥)
 //	复用     yamux(支持半关闭与 RST),一条连接承载多条转发流,新流 0-RTT
-//	UDP      原生 UDP + AES-256-GCM,或封装进隧道流(UDP over TCP)
+//	UDP      原生 UDP + DTLS 1.2,或封装进隧道流(UDP over TCP)
 //	指纹     tls / wss 可用 utls 模拟浏览器的 ClientHello
 //	反向     出口主动拨入入口并保持复用会话,入口在其上开流(出口在内网时使用)
 //
@@ -63,8 +63,7 @@ var (
 // Keys 是由预共享密钥派生出的各用途子密钥。
 type Keys struct {
 	auth   []byte
-	udpC2S []byte // 入口 -> 出口
-	udpS2C []byte // 出口 -> 入口
+	udpPSK []byte
 	http   []byte // http 伪装传输层:令牌校验与记录加密
 	rev    []byte // 反向隧道:出口向入口证明身份
 }
@@ -86,7 +85,7 @@ func DeriveKeys(keyHex string) (*Keys, error) {
 		return m.Sum(nil)
 	}
 	return &Keys{
-		auth: d("kaze auth v1"), udpC2S: d("kaze udp c2s v1"), udpS2C: d("kaze udp s2c v1"),
+		auth: d("kaze auth v1"), udpPSK: d("kaze native DTLS v2"),
 		http: d("kaze http v1"), rev: d("kaze reverse v1"),
 	}, nil
 }
@@ -147,8 +146,7 @@ func (r *replayCache) check(nonce [16]byte, now time.Time) bool {
 }
 
 // verifyPreface 校验前导帧。ekm 非空(绑定了 TLS 会话)时不检查时钟;
-// 明文传输层,以及协商到不支持密钥导出的旧版 TLS(TLS 1.2 且无 EMS,个别 utls 指纹会如此)时,
-// 改为校验时间戳与一次性随机数。
+// 明文传输层校验时间戳与一次性随机数。
 func verifyPreface(p []byte, k *Keys, ekm []byte, now time.Time, rc *replayCache) (flags byte, err error) {
 	if len(p) != prefaceLen || string(p[:4]) != magic {
 		return 0, errAuth

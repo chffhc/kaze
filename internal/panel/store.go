@@ -212,6 +212,23 @@ func openDB(dir string) (*sql.DB, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
+	path := filepath.Join(dir, "kaze.db")
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, err
+	}
+	if err = file.Chmod(0600); err != nil {
+		file.Close()
+		return nil, err
+	}
+	if err = file.Close(); err != nil {
+		return nil, err
+	}
+	for _, suffix := range []string{"-wal", "-shm", ".v1.bak", ".v2.bak", ".v3.bak"} {
+		if err := os.Chmod(path+suffix, 0600); err != nil && !os.IsNotExist(err) {
+			return nil, err
+		}
+	}
 	dsn := "file:" + filepath.ToSlash(filepath.Join(dir, "kaze.db")) +
 		"?_pragma=busy_timeout(8000)&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)&_txlock=immediate"
 	db, err := sql.Open("sqlite", dsn)
@@ -254,11 +271,25 @@ func migrate(db *sql.DB, dir string) error {
 
 	backup := filepath.Join(dir, fmt.Sprintf("kaze.db.v%d.bak", max(ver, 1)))
 	if _, err := os.Stat(backup); os.IsNotExist(err) {
-		// VACUUM INTO 得到一份一致的快照(直接拷贝文件会漏掉 WAL 里尚未合并的内容)
-		if _, err := db.Exec(`VACUUM INTO ?`, backup); err != nil {
-			return fmt.Errorf("升级前备份数据库失败: %w", err)
+		tmp, err := os.CreateTemp(dir, ".kaze-backup-")
+		if err != nil {
+			return err
 		}
+		name := tmp.Name()
+		defer os.Remove(name)
+		if err := tmp.Close(); err != nil {
+			return err
+		}
+		if _, err := db.Exec(`VACUUM INTO ?`, name); err != nil {
+			return fmt.Errorf("备份数据库失败: %w", err)
+		}
+		if err := os.Rename(name, backup); err != nil {
+			return err
+		}
+	} else if err != nil {
+		return err
 	}
+
 	var err error
 	if ver >= 2 {
 		err = migrateLedger(db)
@@ -752,7 +783,7 @@ func (s *Server) setting(key, def string) string {
 }
 
 func (s *Server) loadSettings() error {
-	rows, err := s.db.Query(`SELECT key,value FROM settings`)
+	rows, err := s.reader().Query(`SELECT key,value FROM settings`)
 	if err != nil {
 		return err
 	}

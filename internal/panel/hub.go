@@ -8,6 +8,8 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -17,6 +19,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"kaze/internal/proto"
+	"kaze/internal/relay"
 	"kaze/internal/tunnel"
 )
 
@@ -61,6 +64,7 @@ type nodeConn struct {
 	metricsAt  int64
 	ruleErrors map[int64]string // 节点上报的:规则启动失败的原因
 	skipped    map[int64]string // 面板判定的:因节点端版本过旧而没有下发的规则
+	assigned   map[int64]bool
 	cfgHash    [32]byte
 	closed     bool
 }
@@ -167,6 +171,24 @@ func (h *Hub) pushConfig(c *nodeConn, cfg *proto.NodeConfig, force bool) {
 	same := sum == c.cfgHash
 	c.cfgHash = sum
 	c.skipped = skipped
+	if !same || c.assigned == nil {
+		c.assigned = map[int64]bool{0: true}
+		if out.Inbound != nil {
+			for _, rule := range out.Inbound.Rules {
+				c.assigned[rule.ID] = true
+			}
+		}
+		if out.Outbound != nil {
+			for _, rule := range out.Outbound.Rules {
+				c.assigned[rule.ID] = true
+			}
+		}
+		for id := range c.ruleErrors {
+			if !c.assigned[id] {
+				delete(c.ruleErrors, id)
+			}
+		}
+	}
 	c.mu.Unlock()
 	if same && !force {
 		return
@@ -295,6 +317,19 @@ func (c *nodeConn) trySend(b []byte) {
 
 func mbps(v int) int64 { return int64(v) * 125000 }
 
+// A node may advertise its observed IP or a public IP literal. Private overrides
+// and DNS names must be set by an administrator on the group.
+func advertisedHost(host, peer string) string {
+	if host == peer {
+		return peer
+	}
+	ip, err := netip.ParseAddr(host)
+	if err != nil || relay.RestrictedAddr(ip) {
+		return ""
+	}
+	return ip.Unmap().String()
+}
+
 // endpoints 返回入口连接出口组 g 时使用的地址列表。
 func (h *Hub) endpoints(g *Group) []string {
 	cfg := &g.Config
@@ -311,16 +346,16 @@ func (h *Hub) endpoints(g *Group) []string {
 		}
 		return []string{net.JoinHostPort(cfg.ConnectHost, fmt.Sprint(port))}
 	}
-	nodes, err := listNodes(h.s.db, `WHERE group_id=? AND last_seen>?`, g.ID, now()-nodeRetention)
+	nodes, err := listNodes(h.s.reader(), `WHERE group_id=? AND last_seen>?`, g.ID, now()-nodeRetention)
 	if err != nil {
 		return nil
 	}
 	var out []string
 	seen := map[string]bool{}
 	for _, n := range nodes {
-		host := n.ConnectHost
+		host := cfg.ConnectHost
 		if host == "" {
-			host = cfg.ConnectHost
+			host = advertisedHost(n.ConnectHost, n.IP)
 		}
 		if host == "" {
 			host = n.IP
@@ -329,7 +364,7 @@ func (h *Hub) endpoints(g *Group) []string {
 		if port == 0 {
 			port = n.TunnelPort
 		}
-		if host == "" || port == 0 {
+		if host == "" || port < 1 || port > 65535 {
 			continue
 		}
 		ep := net.JoinHostPort(host, fmt.Sprint(port))
@@ -345,7 +380,7 @@ func (h *Hub) endpoints(g *Group) []string {
 type groupSet map[int64]*Group
 
 func (h *Hub) loadGroups() ([]*Group, groupSet, error) {
-	all, err := listGroups(h.s.db)
+	all, err := listGroups(h.s.reader())
 	if err != nil {
 		return nil, nil, err
 	}
@@ -401,6 +436,7 @@ func (h *Hub) tunnelSpec(g *Group, withFallback bool, groups groupSet, from *Gro
 	}
 	switch {
 	case cfg.CDN:
+		spec.CDN = true
 		spec.Transport = tunnel.TransportWS
 		if cfg.CDNTLS {
 			spec.Transport = tunnel.TransportWSS
@@ -438,10 +474,22 @@ func nextHopKey(groupID int64, mux bool) int64 {
 }
 
 func (h *Hub) buildConfig(groupID int64) (*proto.NodeConfig, error) {
-	db := h.s.db
+	db := h.s.reader()
 	policy, err := loadRulePolicy(db)
 	if err != nil {
 		return nil, err
+	}
+	nodes, err := listNodes(db, "WHERE last_seen>?", now()-nodeRetention)
+	if err != nil {
+		return nil, err
+	}
+	policy.nodeIPs = make(map[int64][]netip.Addr)
+	for _, n := range nodes {
+		for _, host := range []string{n.IP, advertisedHost(n.ConnectHost, n.IP)} {
+			if ip, e := netip.ParseAddr(host); e == nil && !slices.Contains(policy.nodeIPs[n.GroupID], ip.Unmap()) {
+				policy.nodeIPs[n.GroupID] = append(policy.nodeIPs[n.GroupID], ip.Unmap())
+			}
+		}
 	}
 	groups := policy.groups
 	all := policy.all
@@ -465,7 +513,7 @@ func (h *Hub) buildConfig(groupID int64) (*proto.NodeConfig, error) {
 }
 
 func (h *Hub) buildInbound(g *Group, all []*Group, policy *rulePolicy) (*proto.InboundConfig, error) {
-	parents, err := policy.tlsParents(h.s.db)
+	parents, err := policy.tlsParents(h.s.reader())
 	if err != nil {
 		return nil, err
 	}
@@ -489,7 +537,7 @@ func (h *Hub) buildInbound(g *Group, all []*Group, policy *rulePolicy) (*proto.I
 			in.Reverse = &proto.ReverseListen{CertPEM: gc.RevCertPEM, KeyPEM: gc.RevKeyPEM, Groups: allowed}
 		}
 	}
-	rows, err := h.s.db.Query(`SELECT `+ruleCols+`,u.speed_limit,u.conn_limit,u.ip_limit,u.role,u.plan_id FROM rules r
+	rows, err := h.s.reader().Query(`SELECT `+ruleCols+`,u.speed_limit,u.conn_limit,u.ip_limit,u.role,u.plan_id FROM rules r
 		JOIN users u ON u.id=r.user_id WHERE r.in_group=? AND r.paused=0 AND `+activeUserSQL+` AND `+ruleWithinQuotaSQL+` ORDER BY r.id`, g.ID, now())
 	if err != nil {
 		return nil, err
@@ -505,7 +553,7 @@ func (h *Hub) buildInbound(g *Group, all []*Group, policy *rulePolicy) (*proto.I
 		if policy.authorize(&owner, r) != nil || r.TLSMode == proto.TLSModeChild && !parents[r.parentKey()].usable {
 			continue
 		}
-		pr := proto.Rule{
+		pr := proto.Rule{ExcludedTargets: policy.loopTargets(r),
 			ID: r.ID, UserID: r.UserID, ListenPort: r.ListenPort, Proto: r.Proto,
 			LB: r.LB, SpeedLimit: mbps(r.SpeedLimit), ConnLimit: r.ConnLimit, IPLimit: r.IPLimit,
 			TLS: r.tlsInbound(),
@@ -548,7 +596,7 @@ func (h *Hub) buildInbound(g *Group, all []*Group, policy *rulePolicy) (*proto.I
 }
 
 func (h *Hub) buildOutbound(g *Group, all []*Group, policy *rulePolicy) (*proto.OutboundConfig, error) {
-	parents, err := policy.tlsParents(h.s.db)
+	parents, err := policy.tlsParents(h.s.reader())
 	if err != nil {
 		return nil, err
 	}
@@ -570,18 +618,18 @@ func (h *Hub) buildOutbound(g *Group, all []*Group, policy *rulePolicy) (*proto.
 		if !reverseFor(ig, g) {
 			continue
 		}
-		nodes, err := listNodes(h.s.db, `WHERE group_id=? AND rev_port>0 AND last_seen>?`, ig.ID, now()-nodeRetention)
+		nodes, err := listNodes(h.s.reader(), `WHERE group_id=? AND rev_port>0 AND last_seen>?`, ig.ID, now()-nodeRetention)
 		if err != nil {
 			return nil, err
 		}
 		seen := map[string]bool{}
 		for _, n := range nodes {
-			host := n.ConnectHost
+			host := advertisedHost(n.ConnectHost, n.IP)
 			if host == "" {
 				host = n.IP
 			}
 			ep := net.JoinHostPort(host, fmt.Sprint(n.RevPort))
-			if host == "" || seen[ep] {
+			if host == "" || n.RevPort < 1 || n.RevPort > 65535 || seen[ep] {
 				continue
 			}
 			seen[ep] = true
@@ -605,7 +653,7 @@ func (h *Hub) buildOutbound(g *Group, all []*Group, policy *rulePolicy) (*proto.
 			ids, ph = append(ids, og.ID), ph+",?"
 		}
 	}
-	rows, err := h.s.db.Query(`SELECT `+ruleCols+`,u.role,u.plan_id FROM rules r JOIN users u ON u.id=r.user_id
+	rows, err := h.s.reader().Query(`SELECT `+ruleCols+`,u.role,u.plan_id FROM rules r JOIN users u ON u.id=r.user_id
 		WHERE r.out_group IN (`+ph+`) AND r.paused=0 AND r.tls_mode<>'parent' AND `+activeUserSQL+` AND `+ruleWithinQuotaSQL+` ORDER BY r.id`, append(ids, now())...)
 	if err != nil {
 		return nil, err
@@ -624,7 +672,7 @@ func (h *Hub) buildOutbound(g *Group, all []*Group, policy *rulePolicy) (*proto.
 		if !ok || len(hops) == 0 {
 			continue
 		}
-		last := proto.OutRule{ID: r.ID, Targets: r.Targets, LB: r.LB, ProxyProtocol: r.ProxyProtocol, OriginTLS: r.originTLS()}
+		last := proto.OutRule{ExcludedTargets: policy.loopTargets(r), ID: r.ID, Targets: r.Targets, LB: r.LB, ProxyProtocol: r.ProxyProtocol, OriginTLS: r.originTLS()}
 		if chain == nil { // 普通出口:本组是规则选的出口,或是它的故障转移组
 			out.Rules = append(out.Rules, last)
 			continue
@@ -667,7 +715,7 @@ func (h *Hub) serveWS(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
-	g, err := scanGroup(h.s.db.QueryRow(`SELECT `+groupCols+` FROM device_groups WHERE token=?`, token))
+	g, err := scanGroup(h.s.reader().QueryRow(`SELECT `+groupCols+` FROM device_groups WHERE token=?`, token))
 	if err != nil || (g.Type != proto.RoleIn && g.Type != proto.RoleOut) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
@@ -692,13 +740,17 @@ func (h *Hub) serveWS(w http.ResponseWriter, r *http.Request) {
 	}
 	ip := h.s.clientIP(r)
 	t := now()
+	if hello.TunnelPort < 0 || hello.TunnelPort > 65535 {
+		hello.TunnelPort = 0
+	}
+	hello.ConnectHost = advertisedHost(hello.ConnectHost, ip)
 	if hello.RevPort < 0 || hello.RevPort > 65535 || g.Type != proto.RoleIn {
 		hello.RevPort = 0
 	}
 	// 入口节点的地址或反向端口变了,出口那边的反向连接目标也要跟着变
 	var oldIP, oldHost string
 	oldRev := -1
-	h.s.db.QueryRow(`SELECT ip, connect_host, rev_port FROM nodes WHERE group_id=? AND uid=?`, g.ID, hello.UID).Scan(&oldIP, &oldHost, &oldRev)
+	h.s.reader().QueryRow(`SELECT ip, connect_host, rev_port FROM nodes WHERE group_id=? AND uid=?`, g.ID, hello.UID).Scan(&oldIP, &oldHost, &oldRev)
 	revChanged := (hello.RevPort > 0 || oldRev > 0) && (oldRev != hello.RevPort || oldIP != ip || oldHost != hello.ConnectHost)
 	if _, err := h.s.db.Exec(`INSERT INTO nodes(group_id,uid,hostname,ip,version,os,arch,connect_host,tunnel_port,first_seen,last_seen,rev_port)
 		VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
@@ -712,7 +764,7 @@ func (h *Hub) serveWS(w http.ResponseWriter, r *http.Request) {
 		key: fmt.Sprintf("%d/%s", g.ID, hello.UID), groupID: g.ID, role: g.Type, hello: hello, ip: ip,
 		ws: ws, send: make(chan []byte, 64), since: t,
 	}
-	h.s.db.QueryRow(`SELECT id FROM nodes WHERE group_id=? AND uid=?`, g.ID, hello.UID).Scan(&c.nodeID)
+	h.s.reader().QueryRow(`SELECT id FROM nodes WHERE group_id=? AND uid=?`, g.ID, hello.UID).Scan(&c.nodeID)
 
 	h.mu.Lock()
 	if old := h.conns[c.key]; old != nil {
@@ -806,9 +858,14 @@ func (h *Hub) serveWS(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			c.mu.Lock()
+			for id := range st.RuleErrors {
+				if !c.assigned[id] {
+					delete(st.RuleErrors, id)
+				}
+			}
 			c.ruleErrors = st.RuleErrors
 			c.mu.Unlock()
-			if g.Type == proto.RoleOut && st.TunnelPort > 0 {
+			if g.Type == proto.RoleOut && st.TunnelPort > 0 && st.TunnelPort <= 65535 {
 				res, _ := h.s.db.Exec(`UPDATE nodes SET tunnel_port=? WHERE id=? AND tunnel_port<>?`, st.TunnelPort, c.nodeID, st.TunnelPort)
 				if res != nil {
 					if n, _ := res.RowsAffected(); n > 0 {

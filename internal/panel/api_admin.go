@@ -1,6 +1,7 @@
 package panel
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,13 +21,13 @@ import (
 
 func (s *Server) handleAdminStats(w http.ResponseWriter, r *http.Request, u *User) {
 	var users, rules, nodes, groups int
-	s.db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&users)
-	s.db.QueryRow(`SELECT COUNT(*) FROM rules`).Scan(&rules)
-	s.db.QueryRow(`SELECT COUNT(*) FROM nodes`).Scan(&nodes)
-	s.db.QueryRow(`SELECT COUNT(*) FROM device_groups`).Scan(&groups)
+	s.reader().QueryRow(`SELECT COUNT(*) FROM users`).Scan(&users)
+	s.reader().QueryRow(`SELECT COUNT(*) FROM rules`).Scan(&rules)
+	s.reader().QueryRow(`SELECT COUNT(*) FROM nodes`).Scan(&nodes)
+	s.reader().QueryRow(`SELECT COUNT(*) FROM device_groups`).Scan(&groups)
 	var unattributed int64
 	var unattributedBytes float64
-	if err := s.db.QueryRow(`SELECT COUNT(*), TOTAL(MAX(up,0)) + TOTAL(MAX(down,0))
+	if err := s.reader().QueryRow(`SELECT COUNT(*), TOTAL(MAX(up,0)) + TOTAL(MAX(down,0))
 		FROM traffic_unattributed`).Scan(&unattributed, &unattributedBytes); err != nil {
 		s.dbErr(w, err)
 		return
@@ -44,11 +45,11 @@ func (s *Server) handleAdminStats(w http.ResponseWriter, r *http.Request, u *Use
 	day := time.Date(nowT.Year(), nowT.Month(), nowT.Day(), 0, 0, 0, 0, time.Local).Unix()
 	month := time.Date(nowT.Year(), nowT.Month(), 1, 0, 0, 0, 0, time.Local).Unix()
 	income := func(since int64) (v int64) {
-		s.db.QueryRow(`SELECT COALESCE(SUM(amount),0) FROM orders WHERE type='recharge' AND status='paid' AND paid_at>=?`, since).Scan(&v)
+		s.reader().QueryRow(`SELECT COALESCE(SUM(amount),0) FROM orders WHERE type='recharge' AND status='paid' AND paid_at>=?`, since).Scan(&v)
 		return
 	}
 	sales := func(since int64) (v int64) {
-		s.db.QueryRow(`SELECT COALESCE(SUM(amount),0) FROM orders WHERE type IN ('plan','renew') AND status='paid' AND paid_at>=?`, since).Scan(&v)
+		s.reader().QueryRow(`SELECT COALESCE(SUM(amount),0) FROM orders WHERE type IN ('plan','renew') AND status='paid' AND paid_at>=?`, since).Scan(&v)
 		return
 	}
 	// 流量排行(近 24 小时)
@@ -57,7 +58,7 @@ func (s *Server) handleAdminStats(w http.ResponseWriter, r *http.Request, u *Use
 		Billed   int64  `json:"billed"`
 	}
 	tops := []top{}
-	if rows, err := s.db.Query(`SELECT u.username, SUM(t.billed) b FROM traffic_hourly t JOIN users u ON u.id=t.user_id
+	if rows, err := s.reader().Query(`SELECT u.username, SUM(t.billed) b FROM traffic_hourly t JOIN users u ON u.id=t.user_id
 		WHERE t.hour>=? GROUP BY t.user_id ORDER BY b DESC LIMIT 8`, now()-86400); err == nil {
 		for rows.Next() {
 			var t top
@@ -85,7 +86,7 @@ func (s *Server) handleAdminUsers(w http.ResponseWriter, r *http.Request, u *Use
 		q += ` WHERE u.username LIKE ? OR u.note LIKE ?`
 		args = append(args, "%"+kw+"%", "%"+kw+"%")
 	}
-	rows, err := s.db.Query(q+` ORDER BY u.id LIMIT 2000`, args...)
+	rows, err := s.reader().Query(q+` ORDER BY u.id LIMIT 2000`, args...)
 	if err != nil {
 		s.dbErr(w, err)
 		return
@@ -135,25 +136,44 @@ func (s *Server) handleAdminUserCreate(w http.ResponseWriter, r *http.Request, u
 		s.fail(w, 400, "密码至少 8 位")
 		return
 	}
-	res, err := s.db.Exec(`INSERT INTO users(username,password,role,created_at) VALUES(?,?,'user',?)`,
+	tx, err := s.db.Begin()
+	if err != nil {
+		s.dbErr(w, err)
+		return
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`INSERT INTO users(username,password,role,created_at) VALUES(?,?,'user',?)`,
 		strings.TrimSpace(*in.Username), hashPassword(*in.Password), now())
 	if err != nil {
 		s.fail(w, http.StatusConflict, "用户名已被占用")
 		return
 	}
-	id, _ := res.LastInsertId()
+	id, err := res.LastInsertId()
+	if err != nil {
+		s.dbErr(w, err)
+		return
+	}
 	in.Username, in.Password = nil, nil
-	if err := s.updateUser(u, id, &in); err != nil {
+	if err := updateUser(tx, u, id, &in); err != nil {
 		s.fail(w, 400, err.Error())
 		return
 	}
-	nu, _ := getUser(s.db, id)
+	if err := tx.Commit(); err != nil {
+		s.dbErr(w, err)
+		return
+	}
+	s.hub.Dirty()
+	nu, err := getUser(s.reader(), id)
+	if err != nil {
+		s.dbErr(w, err)
+		return
+	}
 	s.ok(w, nu)
 }
 
 // updateUser 按"只改传入字段"的方式更新用户。
-func (s *Server) updateUser(actor *User, id int64, in *userInput) error {
-	old, err := getUser(s.db, id)
+func updateUser(tx *sql.Tx, actor *User, id int64, in *userInput) error {
+	old, err := getUser(tx, id)
 	if err != nil {
 		return fmt.Errorf("用户不存在")
 	}
@@ -175,7 +195,7 @@ func (s *Server) updateUser(actor *User, id int64, in *userInput) error {
 			return fmt.Errorf("密码至少 8 位")
 		}
 		set("password", hashPassword(*in.Password))
-		sets = append(sets, "token_ver=token_ver+1")
+
 	}
 	if in.Role != nil {
 		if *in.Role != "admin" && *in.Role != "user" {
@@ -225,20 +245,25 @@ func (s *Server) updateUser(actor *User, id int64, in *userInput) error {
 	if in.Note != nil {
 		set("note", *in.Note)
 	}
+	if (in.Password != nil && *in.Password != "") || (in.Role != nil && old.Role != *in.Role) || (in.Banned != nil && old.Banned != *in.Banned) {
+		sets = append(sets, "token_ver=token_ver+1")
+	}
 	if len(sets) == 0 {
 		return nil
 	}
 	args = append(args, id)
-	if _, err := s.db.Exec(`UPDATE users SET `+strings.Join(sets, ",")+` WHERE id=?`, args...); err != nil {
+	if _, err := tx.Exec(`UPDATE users SET `+strings.Join(sets, ",")+` WHERE id=?`, args...); err != nil {
 		return fmt.Errorf("保存失败(用户名可能已被占用)")
 	}
 	if in.Balance != nil && *in.Balance != old.Balance {
 		t := now()
-		s.db.Exec(`INSERT INTO orders(order_no,user_id,type,amount,status,pay_method,note,created_at,paid_at)
+		_, err := tx.Exec(`INSERT INTO orders(order_no,user_id,type,amount,status,pay_method,note,created_at,paid_at)
 			VALUES(?,?,'admin',?,'paid','admin',?,?,?)`, orderNo(), id, *in.Balance-old.Balance,
 			"管理员 "+actor.Username+" 调整余额", t, t)
+		if err != nil {
+			return err
+		}
 	}
-	s.hub.Dirty()
 	return nil
 }
 
@@ -248,11 +273,22 @@ func (s *Server) handleAdminUserUpdate(w http.ResponseWriter, r *http.Request, u
 		s.fail(w, 400, err.Error())
 		return
 	}
-	if err := s.updateUser(u, pathID(r), &in); err != nil {
+	tx, err := s.db.Begin()
+	if err != nil {
+		s.dbErr(w, err)
+		return
+	}
+	defer tx.Rollback()
+	if err := updateUser(tx, u, pathID(r), &in); err != nil {
 		s.fail(w, 400, err.Error())
 		return
 	}
-	nu, err := getUser(s.db, pathID(r))
+	if err := tx.Commit(); err != nil {
+		s.dbErr(w, err)
+		return
+	}
+	s.hub.Dirty()
+	nu, err := getUser(s.reader(), pathID(r))
 	if err != nil {
 		s.dbErr(w, err)
 		return
@@ -270,7 +306,7 @@ func (s *Server) handleAdminUserDelete(w http.ResponseWriter, r *http.Request, u
 	defer s.ruleMu.Unlock()
 	// 管理员名下的共享 TLS 端口还挂着别人的子规则时,不能连带删掉
 	var orphans int
-	s.db.QueryRow(`SELECT COUNT(*) FROM rules c JOIN rules p ON p.in_group=c.in_group AND p.listen_port=c.listen_port AND p.tls_mode='parent'
+	s.reader().QueryRow(`SELECT COUNT(*) FROM rules c JOIN rules p ON p.in_group=c.in_group AND p.listen_port=c.listen_port AND p.tls_mode='parent'
 		WHERE c.tls_mode='child' AND p.user_id=? AND c.user_id<>?`, id, id).Scan(&orphans)
 	if orphans > 0 {
 		s.fail(w, 400, fmt.Sprintf("该用户创建的共享 TLS 端口下还有其他用户的 %d 条子规则,请先处理这些规则", orphans))
@@ -308,11 +344,14 @@ func (s *Server) installCmd(r *http.Request, g *Group) string {
 		return "" // 链式出口没有自己的机器
 	}
 	base := s.baseURL(r)
-	return fmt.Sprintf("bash <(curl -fsSL %s/install.sh) -u %s -t %s", base, base, g.Token)
+	if !validBaseURL(base) {
+		return ""
+	}
+	return fmt.Sprintf("bash <(curl -fsSL '%s/install.sh') -u '%s' -t '%s'", base, base, g.Token)
 }
 
 func (s *Server) handleAdminGroups(w http.ResponseWriter, r *http.Request, u *User) {
-	groups, err := listGroups(s.db)
+	groups, err := listGroups(s.reader())
 	if err != nil {
 		s.dbErr(w, err)
 		return
@@ -321,7 +360,7 @@ func (s *Server) handleAdminGroups(w http.ResponseWriter, r *http.Request, u *Us
 	online := s.hub.onlineCount()
 	count := func(q string) map[int64]int {
 		m := map[int64]int{}
-		if rows, err := s.db.Query(q); err == nil {
+		if rows, err := s.reader().Query(q); err == nil {
 			for rows.Next() {
 				var id int64
 				var n int
@@ -337,9 +376,10 @@ func (s *Server) handleAdminGroups(w http.ResponseWriter, r *http.Request, u *Us
 	ruleOut := count(`SELECT out_group, COUNT(*) FROM rules WHERE out_group<>0 GROUP BY out_group`)
 	out := []adminGroupView{}
 	for _, g := range groups {
+		g.Token = ""
+		g.Config.TunnelKey, g.Config.KeyPEM, g.Config.RevKeyPEM = "", "", ""
 		v := adminGroupView{
 			Group: g, Online: online[g.ID], NodeCount: nodeN[g.ID], RuleCount: ruleIn[g.ID] + ruleOut[g.ID],
-			InstallCmd: s.installCmd(r, g),
 		}
 		if g.Type == proto.RoleChain {
 			// 在线数取各跳里最少的;链路不完整时为 0
@@ -353,6 +393,16 @@ func (s *Server) handleAdminGroups(w http.ResponseWriter, r *http.Request, u *Us
 		out = append(out, v)
 	}
 	s.ok(w, out)
+}
+
+func (s *Server) handleAdminGroupDetails(w http.ResponseWriter, r *http.Request, u *User) {
+	g, err := getGroup(s.reader(), pathID(r))
+	if err != nil {
+		s.dbErr(w, err)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	s.ok(w, adminGroupView{Group: g, InstallCmd: s.installCmd(r, g)})
 }
 
 type groupInput struct {
@@ -630,7 +680,7 @@ func (s *Server) handleAdminGroupCreate(w http.ResponseWriter, r *http.Request, 
 		s.fail(w, 400, err.Error())
 		return
 	}
-	all, err := listGroups(s.db)
+	all, err := listGroups(s.reader())
 	if err != nil {
 		s.dbErr(w, err)
 		return
@@ -647,7 +697,7 @@ func (s *Server) handleAdminGroupCreate(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 	id, _ := res.LastInsertId()
-	g, err := getGroup(s.db, id)
+	g, err := getGroup(s.reader(), id)
 	if err != nil {
 		s.dbErr(w, err)
 		return
@@ -658,7 +708,7 @@ func (s *Server) handleAdminGroupCreate(w http.ResponseWriter, r *http.Request, 
 func (s *Server) handleAdminGroupUpdate(w http.ResponseWriter, r *http.Request, u *User) {
 	s.ruleMu.Lock()
 	defer s.ruleMu.Unlock()
-	old, err := getGroup(s.db, pathID(r))
+	old, err := getGroup(s.reader(), pathID(r))
 	if err != nil {
 		s.dbErr(w, err)
 		return
@@ -672,7 +722,7 @@ func (s *Server) handleAdminGroupUpdate(w http.ResponseWriter, r *http.Request, 
 	if in.Type == "" {
 		in.Type = old.Type
 	}
-	all, err := listGroups(s.db)
+	all, err := listGroups(s.reader())
 	if err != nil {
 		s.dbErr(w, err)
 		return
@@ -698,7 +748,7 @@ func (s *Server) handleAdminGroupDelete(w http.ResponseWriter, r *http.Request, 
 	s.ruleMu.Lock()
 	defer s.ruleMu.Unlock()
 	id := pathID(r)
-	all, err := listGroups(s.db)
+	all, err := listGroups(s.reader())
 	if err != nil {
 		s.dbErr(w, err)
 		return
@@ -710,7 +760,7 @@ func (s *Server) handleAdminGroupDelete(w http.ResponseWriter, r *http.Request, 
 		}
 	}
 	var n int
-	if err := s.db.QueryRow(`SELECT COUNT(*) FROM rules WHERE in_group=? OR out_group=?`, id, id).Scan(&n); err != nil {
+	if err := s.reader().QueryRow(`SELECT COUNT(*) FROM rules WHERE in_group=? OR out_group=?`, id, id).Scan(&n); err != nil {
 		s.dbErr(w, err)
 		return
 	}
@@ -746,7 +796,7 @@ func (s *Server) handleAdminGroupDelete(w http.ResponseWriter, r *http.Request, 
 }
 
 func (s *Server) handleAdminGroupResetToken(w http.ResponseWriter, r *http.Request, u *User) {
-	g, err := getGroup(s.db, pathID(r))
+	g, err := getGroup(s.reader(), pathID(r))
 	if err != nil {
 		s.dbErr(w, err)
 		return
@@ -767,7 +817,7 @@ func (s *Server) handleAdminGroupResetToken(w http.ResponseWriter, r *http.Reque
 // ---- 节点 ----
 
 func (s *Server) handleAdminNodes(w http.ResponseWriter, r *http.Request, u *User) {
-	nodes, err := listNodes(s.db, "")
+	nodes, err := listNodes(s.reader(), "")
 	if err != nil {
 		s.dbErr(w, err)
 		return
@@ -787,7 +837,7 @@ func (s *Server) handleAdminNodes(w http.ResponseWriter, r *http.Request, u *Use
 func (s *Server) handleAdminNodeDelete(w http.ResponseWriter, r *http.Request, u *User) {
 	var gid int64
 	var uid string
-	if err := s.db.QueryRow(`SELECT group_id, uid FROM nodes WHERE id=?`, pathID(r)).Scan(&gid, &uid); err != nil {
+	if err := s.reader().QueryRow(`SELECT group_id, uid FROM nodes WHERE id=?`, pathID(r)).Scan(&gid, &uid); err != nil {
 		s.dbErr(w, err)
 		return
 	}
@@ -803,7 +853,7 @@ func (s *Server) handleAdminNodeDelete(w http.ResponseWriter, r *http.Request, u
 // ---- 套餐 ----
 
 func (s *Server) handleAdminPlans(w http.ResponseWriter, r *http.Request, u *User) {
-	plans, err := listPlans(s.db, true)
+	plans, err := listPlans(s.reader(), true)
 	if err != nil {
 		s.dbErr(w, err)
 		return
@@ -866,7 +916,7 @@ func (s *Server) handleAdminOrders(w http.ResponseWriter, r *http.Request, u *Us
 }
 
 func (s *Server) handleAdminCodes(w http.ResponseWriter, r *http.Request, u *User) {
-	rows, err := s.db.Query(`SELECT c.id,c.code,c.type,c.amount,c.plan_id,c.used_by,COALESCE(u.username,''),c.used_at,c.note,c.created_at
+	rows, err := s.reader().Query(`SELECT c.id,c.code,c.type,c.amount,c.plan_id,c.used_by,COALESCE(u.username,''),c.used_at,c.note,c.created_at
 		FROM redeem_codes c LEFT JOIN users u ON u.id=c.used_by ORDER BY c.id DESC LIMIT 2000`)
 	if err != nil {
 		s.dbErr(w, err)
@@ -921,7 +971,7 @@ func (s *Server) handleAdminCodeCreate(w http.ResponseWriter, r *http.Request, u
 		}
 		in.PlanID = 0
 	case "plan":
-		if _, err := getPlan(s.db, in.PlanID); err != nil {
+		if _, err := getPlan(s.reader(), in.PlanID); err != nil {
 			s.fail(w, 400, "套餐不存在")
 			return
 		}
@@ -997,7 +1047,7 @@ func (s *Server) handleAdminSettingsSave(w http.ResponseWriter, r *http.Request,
 		if k == "epay_key" && v == "" {
 			continue // 留空表示不修改
 		}
-		if (k == "panel_url" || k == "epay_url") && v != "" && !strings.HasPrefix(v, "http://") && !strings.HasPrefix(v, "https://") {
+		if (k == "panel_url" || k == "epay_url") && v != "" && !validBaseURL(v) {
 			s.fail(w, 400, k+" 必须以 http:// 或 https:// 开头")
 			return
 		}
