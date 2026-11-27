@@ -646,26 +646,32 @@ func (r *ruleRunner) handleTLS(c net.Conn) {
 			<-handshakeSlots
 		}
 	}()
-	src := addrPortOf(c.RemoteAddr())
-	if !relay.AcquireAll(src.Addr(), r.rlim, r.ulim) {
-		c.Close()
+	if !r.live.start(c) { // 握手及后续连接生命周期记在监听它的规则名下
 		return
 	}
-	admission := r
+	src := addrPortOf(c.RemoteAddr())
+	var (
+		admission *ruleRunner
+		selected  *ruleRunner
+		wire      *tlsWire
+	)
 	defer func() {
 		if admission != nil {
 			relay.ReleaseAll(src.Addr(), admission.rlim, admission.ulim)
 		}
+		if selected != nil {
+			selected.live.finish(wire)
+		}
+		r.live.finish(c)
 	}()
-	if !r.live.track(c) { // 握手期间的连接记在监听它的规则名下
+	if !relay.AcquireAll(src.Addr(), r.rlim, r.ulim) {
 		c.Close()
 		return
 	}
-	defer r.live.forget(c)
-	var selected *ruleRunner
+	admission = r
 	ctx, cancel := context.WithTimeout(r.live.ctx, tlsHandshakeTimeout)
 	defer cancel()
-	wire := &tlsWire{Conn: c, r: r, ctx: ctx, handshake: true}
+	wire = &tlsWire{Conn: c, r: r, ctx: ctx, handshake: true}
 	tc := tls.Server(wire, &tls.Config{
 		MinVersion: tls.VersionTLS12,
 		GetConfigForClient: func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
@@ -673,6 +679,10 @@ func (r *ruleRunner) handleTLS(c net.Conn) {
 			if err != nil {
 				return nil, err
 			}
+			if !t.r.live.start(wire) {
+				return nil, net.ErrClosed
+			}
+			selected = t.r
 			if t.r != r {
 				relay.ReleaseAll(src.Addr(), r.rlim, r.ulim)
 				admission = nil
@@ -681,10 +691,6 @@ func (r *ruleRunner) handleTLS(c net.Conn) {
 				}
 				admission = t.r
 			}
-			if !t.r.live.start(wire) {
-				return nil, net.ErrClosed
-			}
-			selected = t.r
 			wire.r = t.r
 			return t.cfg, nil
 		},
@@ -692,9 +698,6 @@ func (r *ruleRunner) handleTLS(c net.Conn) {
 	err := tc.HandshakeContext(ctx)
 	<-handshakeSlots
 	slot = false
-	if selected != nil {
-		defer selected.live.finish(wire)
-	}
 	cancel()
 	if err != nil {
 		c.Close()
@@ -717,6 +720,11 @@ func (r *ruleRunner) handleTLS(c net.Conn) {
 // serve 转发一条客户端连接。c 是原始 TCP 连接,或入口终结 TLS 之后的明文连接。
 // TLS 会话已在握手期间取得连接配额并开始按线上字节计量。
 func (r *ruleRunner) serve(c net.Conn, src netip.AddrPort, admitted bool, alpn, outerHost string) {
+	if !r.live.start(c) {
+		return
+	}
+	defer r.live.finish(c)
+
 	if !admitted {
 		if !relay.AcquireAll(src.Addr(), r.rlim, r.ulim) {
 			c.Close()
@@ -724,11 +732,6 @@ func (r *ruleRunner) serve(c net.Conn, src netip.AddrPort, admitted bool, alpn, 
 		}
 		defer relay.ReleaseAll(src.Addr(), r.rlim, r.ulim)
 	}
-
-	if !r.live.start(c) {
-		return
-	}
-	defer r.live.finish(c)
 
 	var prefix []byte
 	{

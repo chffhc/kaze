@@ -58,6 +58,20 @@ type helloReader struct {
 func (c helloReader) Read(b []byte) (int, error)  { return c.input.Read(b) }
 func (c helloReader) Write(b []byte) (int, error) { return len(b), nil }
 
+func isTokenByte(ch byte) bool {
+	return ch >= 'A' && ch <= 'Z' || ch >= 'a' && ch <= 'z' || ch >= '0' && ch <= '9' ||
+		strings.ContainsRune("!#$%&'*+-.^_`|~", rune(ch))
+}
+
+func isHTTPMethod(m string) bool {
+	switch strings.ToUpper(m) {
+	case "GET", "HEAD", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH",
+		"PRI", "PROPFIND", "PROPPATCH", "MKCOL", "COPY", "MOVE", "LOCK", "UNLOCK":
+		return true
+	}
+	return false
+}
+
 func (p *SniffPolicy) Check(c net.Conn) ([]byte, bool) { return p.CheckInner(c, "") }
 func (p *SniffPolicy) CheckInner(c net.Conn, outerHost string) ([]byte, bool) {
 	var prefix bytes.Buffer
@@ -87,28 +101,54 @@ func (p *SniffPolicy) CheckInner(c net.Conn, outerHost string) ([]byte, bool) {
 	case 4, 5:
 		return prefix.Bytes(), !p.BlockSocks && p.HostAllowed(outerHost)
 	}
-	// HTTP methods are case-sensitive tokens. Inspect the complete header before forwarding.
-	for i := 1; i <= 32; i++ {
-		b, err := r.Peek(i)
+	// Classify text protocols by method / first line before buffering full HTTP headers.
+	var token bytes.Buffer
+	for {
+		ch, err := r.ReadByte()
 		if err != nil {
 			return nil, false
 		}
-		ch := b[i-1]
-		if ch == ' ' && i > 1 {
-			host, valid := readPolicyHTTP(r)
-			return prefix.Bytes(), valid && !p.BlockHTTP && p.HostAllowed(host)
+		if (ch == 0x0b || ch == 0x0c) && isHTTPMethod(token.String()) {
+			return nil, false
 		}
-		if !(ch >= 'A' && ch <= 'Z' || ch >= 'a' && ch <= 'z' || ch >= '0' && ch <= '9' || strings.ContainsRune("!#$%&'*+-.^_\u0060|~", rune(ch))) {
+		if ch == ' ' || ch == '\t' {
+			rest, err := r.ReadString('\n')
+			if err != nil {
+				return nil, false
+			}
+			firstLine := token.String() + string(ch) + rest
+			if firstLine == "PRI * HTTP/2.0\r\n" {
+				var tail [8]byte
+				if _, err := io.ReadFull(r, tail[:]); err != nil || string(tail[:]) != "\r\nSM\r\n\r\n" {
+					return nil, false
+				}
+				return prefix.Bytes(), !p.BlockHTTP && p.HostAllowed(outerHost) && (outerHost != "" || len(p.BlockedHosts) == 0)
+			}
+			upperRest := strings.ToUpper(rest)
+			if isHTTPMethod(token.String()) || strings.Contains(upperRest, "HTTP/") || strings.Contains(upperRest, "HTTP://") || strings.Contains(upperRest, "HTTPS://") {
+				if ch != ' ' {
+					return nil, false
+				}
+				host, valid := readPolicyHTTP(firstLine, r)
+				return prefix.Bytes(), valid && !p.BlockHTTP && p.HostAllowed(host)
+			}
 			return prefix.Bytes(), p.HostAllowed(outerHost)
 		}
+		if !isTokenByte(ch) {
+			return prefix.Bytes(), p.HostAllowed(outerHost)
+		}
+		token.WriteByte(ch)
 	}
-	return nil, false
 }
 
-func readPolicyHTTP(r *bufio.Reader) (string, bool) {
+func readPolicyHTTP(firstLine string, r *bufio.Reader) (string, bool) {
+	if !strings.HasSuffix(firstLine, "\r\n") || strings.ContainsAny(firstLine[:len(firstLine)-2], "\r\n\t") {
+		return "", false
+	}
 	var head bytes.Buffer
+	head.WriteString(firstLine)
 	var authority string
-	for lineNo := 0; ; lineNo++ {
+	for {
 		line, err := r.ReadString('\n')
 		if err != nil || !strings.HasSuffix(line, "\r\n") || strings.ContainsAny(line[:len(line)-2], "\r\n") {
 			return "", false
@@ -117,22 +157,20 @@ func readPolicyHTTP(r *bufio.Reader) (string, bool) {
 		if line == "\r\n" {
 			break
 		}
-		if lineNo > 0 {
-			if line[0] == ' ' || line[0] == '\t' {
+		if line[0] == ' ' || line[0] == '\t' {
+			return "", false
+		}
+		key, value, ok := strings.Cut(line, ":")
+		if !ok || strings.ContainsAny(key, " \t") {
+			return "", false
+		}
+		if strings.EqualFold(key, "Host") {
+			if authority != "" {
 				return "", false
 			}
-			key, value, ok := strings.Cut(line, ":")
-			if !ok {
+			authority = strings.TrimSpace(value)
+			if authority == "" {
 				return "", false
-			}
-			if strings.EqualFold(key, "Host") {
-				if authority != "" {
-					return "", false
-				}
-				authority = strings.TrimSpace(value)
-				if authority == "" {
-					return "", false
-				}
 			}
 		}
 	}
@@ -143,10 +181,14 @@ func readPolicyHTTP(r *bufio.Reader) (string, bool) {
 	if authority == "" || !strings.EqualFold(req.Host, authority) {
 		return "", false
 	}
+	if req.URL.Host != "" && !strings.EqualFold(req.URL.Host, authority) {
+		return "", false
+	}
 	host := authority
 	if h, _, err := net.SplitHostPort(host); err == nil {
 		host = h
 	}
+	host = strings.Trim(host, "[]")
 	return host, true
 }
 
