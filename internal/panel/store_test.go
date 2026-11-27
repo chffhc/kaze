@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -587,6 +588,39 @@ func TestMigrateV2Ledger(t *testing.T) {
 	for _, table := range []string{"traffic_cursors", "traffic_unattributed"} {
 		if n := scalar[int](t, db, `SELECT COUNT(*) FROM sqlite_master WHERE name=? AND type='table'`, table); n != 1 {
 			t.Fatal(table)
+		}
+	}
+}
+
+func TestMigrationFilePermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permission bits")
+	}
+	dir := copyFixture(t)
+	path := filepath.Join(dir, "kaze.db")
+	if err := os.Chmod(path, 0644); err != nil {
+		t.Fatal(err)
+	}
+	// First open creates the backup. The second repairs an existing backup.
+	for i := 0; i < 2; i++ {
+		db, err := openDB(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		db.Close()
+		for _, p := range []string{path, path + ".v1.bak"} {
+			info, err := os.Stat(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if info.Mode().Perm() != 0600 {
+				t.Errorf("%s mode = %o", p, info.Mode().Perm())
+			}
+		}
+		if i == 0 {
+			if err := os.Chmod(path+".v1.bak", 0644); err != nil {
+				t.Fatal(err)
+			}
 		}
 	}
 }

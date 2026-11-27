@@ -16,7 +16,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"net/netip"
 	"net/url"
@@ -287,14 +286,15 @@ func pathID(r *http.Request) int64 {
 }
 
 func (s *Server) trustedProxy(r *http.Request) bool {
-	if !s.opt.TrustProxy {
+	peer, err := netip.ParseAddrPort(r.RemoteAddr)
+	return err == nil && s.trustedProxyAddr(peer.Addr())
+}
+
+func (s *Server) trustedProxyAddr(addr netip.Addr) bool {
+	if !s.opt.TrustProxy || addr.Zone() != "" {
 		return false
 	}
-	ap, err := netip.ParseAddrPort(r.RemoteAddr)
-	if err != nil {
-		return false
-	}
-	addr := ap.Addr().Unmap()
+	addr = addr.Unmap()
 	if len(s.proxies) == 0 {
 		return addr.IsLoopback()
 	}
@@ -307,19 +307,28 @@ func (s *Server) trustedProxy(r *http.Request) bool {
 }
 
 func (s *Server) clientIP(r *http.Request) string {
-	if s.trustedProxy(r) {
-		// The immediate proxy appends the address it observed at the right.
-		chain := strings.Join(r.Header.Values("X-Forwarded-For"), ",")
-		last := strings.TrimSpace(chain[strings.LastIndexByte(chain, ',')+1:])
-		if ip, err := netip.ParseAddr(last); err == nil && ip.Zone() == "" {
-			return ip.Unmap().String()
-		}
-	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	peer, err := netip.ParseAddrPort(r.RemoteAddr)
 	if err != nil {
 		return r.RemoteAddr
 	}
-	return host
+	addr := peer.Addr().Unmap()
+	lines := r.Header.Values("X-Forwarded-For")
+	for i := len(lines) - 1; i >= 0 && s.trustedProxyAddr(addr); i-- {
+		line := lines[i]
+		for s.trustedProxyAddr(addr) {
+			comma := strings.LastIndexByte(line, ',')
+			next, err := netip.ParseAddr(strings.TrimSpace(line[comma+1:]))
+			if err != nil || next.Zone() != "" {
+				return addr.String()
+			}
+			addr = next.Unmap()
+			if comma == -1 {
+				break
+			}
+			line = line[:comma]
+		}
+	}
+	return addr.String()
 }
 
 // baseURL 返回面板的对外地址:优先用设置里的 panel_url,否则从请求推断。

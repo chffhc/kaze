@@ -180,7 +180,7 @@ func (in *inbound) applyReverseLocked(rc *proto.ReverseListen) {
 		return
 	}
 	if in.rev == nil {
-		ln, err := tunnel.NewReverseListener(in.a.opt.Bind, port, in.a.now)
+		ln, err := tunnel.NewReverseListener(in.a.opt.Bind, port)
 		if err != nil {
 			in.revErr = fmt.Sprintf("反向隧道端口 %d 监听失败: %v", port, err)
 			log.Printf("[入口] %s", in.revErr)

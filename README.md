@@ -46,7 +46,7 @@ panel.example.com {
 }
 ```
 
-`-trust-proxy` 只应在面板位于反向代理之后时开启,否则访客可以伪造来源 IP 绕过登录限流。面板仅信任列在 `-proxy-cidrs`（环境变量 `KAZE_PROXY_CIDRS`）中的直接代理，默认仅回环地址。代理必须在 `X-Forwarded-For` 末尾追加实际对端或覆盖该请求头。Docker 环境若需要真实 IP，请显式设置 `KAZE_TRUST_PROXY=1` 并填写面板实际看到的代理地址 CIDR。长期运行可用 `scripts/kaze-panel.service`,或者 `docker compose up -d`。
+`-trust-proxy` 只应在面板位于反向代理之后时开启,否则访客可以伪造来源 IP 绕过登录限流。面板仅信任列在 `-proxy-cidrs`（环境变量 `KAZE_PROXY_CIDRS`）中的代理，默认仅回环地址。面板从直接对端开始，自右向左检查转发链，以第一个不受信任的地址作为来源。遇到无效地址时，采用上一个已确认的地址。代理必须在 `X-Forwarded-For` 末尾追加实际对端或覆盖该请求头。Docker 环境若需要真实 IP，请显式设置 `KAZE_TRUST_PROXY=1` 并填写面板实际看到的代理地址 CIDR。长期运行可用 `scripts/kaze-panel.service`,或者 `docker compose up -d`。
 
 登录后的操作顺序是:在"站点设置"里填面板对外地址;在"设备组"里新建入口组(需要隧道时再建出口组);点"对接",把命令复制到机器上以 root 运行;在"套餐"里建套餐,或在"用户"里直接给用户设置额度;之后用户就可以建规则了。
 
@@ -66,7 +66,7 @@ bash <(curl -fsSL https://panel.example.com/install.sh) -u https://panel.example
 
 转发方面支持 TCP、UDP 和 TCP+UDP 规则;入口直出(专线场景)或经出口隧道;多目标的轮询、随机、最小连接数、按来源 IP、主备五种均衡策略,带被动故障摘除;PROXY protocol v1/v2,经隧道(包括多跳)时同样能把访客真实 IP 传到目标;批量导入规则;链路诊断(各节点依次测量到下一跳的连通情况)。
 
-隧道的传输层有 tls、wss、http、ws、tcp 五种。出口组内多台机器按最小连接数均衡并自动故障转移,可以再指定一个故障转移组。多路复用开启后新连接不需要重新握手。UDP 默认走与隧道同端口的原生 UDP 通道(DTLS 1.2，预共享密钥认证),也可以改成 UDP over TCP。CDN 模式下出口监听明文 WebSocket 供 CDN 回源。
+隧道的传输层有 tls、wss、http、ws、tcp 五种。出口组内多台机器按最小连接数均衡并自动故障转移,可以再指定一个故障转移组。多路复用开启后新连接不需要重新握手。UDP 默认走与隧道同端口的原生 UDP 通道(DTLS 1.2，预共享密钥认证，每次握手生成的会话密钥最多使用一小时),也可以改成 UDP over TCP。CDN 模式下出口监听明文 WebSocket 供 CDN 回源。
 
 限制方面有规则级和用户级两层限速、连接数、来源 IP 数,都在入口执行,各入口独立计算,同一用户在同一入口的所有规则共享用户级额度。入口组可以配置端口范围、直出策略、可用出口、屏蔽 HTTP/TLS/SOCKS 协议、SNI/Host 黑白名单、禁用 UDP。默认拒绝把流量转发到内网和本机地址,需要时在设备组里打开。
 
@@ -94,7 +94,7 @@ bash <(curl -fsSL https://panel.example.com/install.sh) -u https://panel.example
 
 出口组的传输层选"HTTP 伪装"后,入口到出口的每条连接以一次普通的 HTTP/1.1 请求和 200 响应开头,请求头和响应头里没有 Upgrade 字样,之后是加密的数据流;没有密钥的访问者只会得到一个 nginx 样式的 404。入口要等到出口的响应才开始发数据,所以建立一条隧道连接比 tls 多一次往返,开启多路复用后这个代价只在建立复用连接时付一次。它只是外观上的伪装,头部之后不是合法的 HTTP 报文体,两端之间必须直连,不能经过 CDN 或反向代理。
 
-传输层是 tls 或 wss 时,可以在出口组里选一个"TLS 握手指纹",入口连接出口时发出的 ClientHello 会模拟对应的浏览器(chrome、firefox、safari、ios、android、edge、qq,由 utls 库提供)。反向隧道里由出口拨号时同样生效。
+传输层是 tls 或 wss 时,可以在出口组里选一个"TLS 握手指纹",入口连接出口时发出的 ClientHello 会模拟对应的浏览器(chrome、firefox、safari、ios、edge、qq,由 utls 库提供)。正反向 TLS 隧道及 WSS 握手要求 TLS 1.3。已有 android 和 360 配置使用 Go 标准 TLS。反向隧道里由出口拨号时同样生效。
 
 ## 从 1.0 升级
 

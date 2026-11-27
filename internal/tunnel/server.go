@@ -65,7 +65,7 @@ func NewServer(cfg ServerConfig, h Handler) (*Server, error) {
 		if cfg.Cert == nil {
 			return nil, errors.New("tls/wss 传输层缺少证书")
 		}
-		s.tlsCfg = &tls.Config{Certificates: []tls.Certificate{*cfg.Cert}, MinVersion: tls.VersionTLS12}
+		s.tlsCfg = &tls.Config{Certificates: []tls.Certificate{*cfg.Cert}, MinVersion: tls.VersionTLS13}
 		if cfg.Transport == TransportTLS {
 			s.tlsCfg.NextProtos = []string{"h2", "http/1.1"}
 		} else {
@@ -172,10 +172,7 @@ func (s *Server) handleRaw(c net.Conn) {
 			return
 		}
 		cs := tc.ConnectionState()
-		if !safeTLS(cs.Version, cs.CipherSuite) {
-			return
-		}
-		ekm, err := exportEKM(cs.ExportKeyingMaterial)
+		ekm, err := exportEKM(cs.Version, cs.ExportKeyingMaterial)
 		if err != nil {
 			return
 		}
@@ -206,13 +203,13 @@ func (s *Server) serveWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var ekm []byte
-	if r.TLS != nil {
-		if !safeTLS(r.TLS.Version, r.TLS.CipherSuite) {
+	if s.cfg.Transport == TransportWSS {
+		if r.TLS == nil {
 			http.Error(w, "unauthorized", 401)
 			return
 		}
 		var err error
-		ekm, err = exportEKM(r.TLS.ExportKeyingMaterial)
+		ekm, err = exportEKM(r.TLS.Version, r.TLS.ExportKeyingMaterial)
 		if err != nil {
 			http.Error(w, "unauthorized", 401)
 			return

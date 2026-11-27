@@ -69,30 +69,42 @@ func targetsListener(network string, ap netip.AddrPort) bool {
 	return false
 }
 
+// netip.IsGlobalUnicast includes several IANA special-purpose address blocks.
 var specialNetworks = []netip.Prefix{
-	netip.MustParsePrefix("0.0.0.0/8"), netip.MustParsePrefix("198.18.0.0/15"), netip.MustParsePrefix("240.0.0.0/4"),
-	netip.MustParsePrefix("64:ff9b::/96"), netip.MustParsePrefix("64:ff9b:1::/48"), netip.MustParsePrefix("2002::/16"), netip.MustParsePrefix("2001::/32"),
+	netip.MustParsePrefix("0.0.0.0/8"), netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("192.0.0.0/24"), netip.MustParsePrefix("192.0.2.0/24"),
+	netip.MustParsePrefix("192.88.99.0/24"), netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("198.51.100.0/24"), netip.MustParsePrefix("203.0.113.0/24"),
+	netip.MustParsePrefix("240.0.0.0/4"), netip.MustParsePrefix("2001::/23"),
+	netip.MustParsePrefix("2001:db8::/32"), netip.MustParsePrefix("2002::/16"),
+	netip.MustParsePrefix("3fff::/20"),
 }
 
+// Globally reachable IANA assignments within the special-purpose blocks above.
+var publicAssignments = []netip.Prefix{
+	netip.MustParsePrefix("192.0.0.9/32"), netip.MustParsePrefix("192.0.0.10/32"),
+	netip.MustParsePrefix("2001:1::1/128"), netip.MustParsePrefix("2001:1::2/128"), netip.MustParsePrefix("2001:1::3/128"),
+	netip.MustParsePrefix("2001:3::/32"), netip.MustParsePrefix("2001:4:112::/48"),
+	netip.MustParsePrefix("2001:20::/28"), netip.MustParsePrefix("2001:30::/28"),
+}
+
+var globalIPv6 = netip.MustParsePrefix("2000::/3")
+
 func RestrictedAddr(a netip.Addr) bool {
-	if !a.IsValid() || a.Zone() != "" {
+	if a.Zone() != "" {
+		return true
+	}
+	a = a.Unmap()
+	if !a.IsGlobalUnicast() || a.IsPrivate() {
+		return true
+	}
+	// Excludes NAT64, discard-only and other non-public IPv6 address space.
+	if a.Is6() && !globalIPv6.Contains(a) {
 		return true
 	}
 	for _, p := range specialNetworks {
-		if p.Contains(a.Unmap()) {
-			return true
-		}
-	}
-	a = a.Unmap()
-	if a.IsLoopback() || a.IsPrivate() || a.IsLinkLocalUnicast() || a.IsLinkLocalMulticast() ||
-		a.IsMulticast() || a.IsUnspecified() {
-		return true
-	}
-	// 100.64.0.0/10 运营商级 NAT
-	if a.Is4() {
-		b := a.As4()
-		if b[0] == 100 && b[1]&0xc0 == 64 {
-			return true
+		if p.Contains(a) {
+			return !slices.ContainsFunc(publicAssignments, func(allowed netip.Prefix) bool { return allowed.Contains(a) })
 		}
 	}
 	return false

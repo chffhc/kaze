@@ -14,6 +14,8 @@ import (
 	"kaze/internal/relay"
 )
 
+const nativeSessionLifetime = time.Hour
+
 const datagramChunk = 4096 // Leave headroom below the DTLS library's receive buffer.
 const fragmentHeader = 7   // message number, datagram length, fragment index
 
@@ -26,13 +28,21 @@ type assembly struct {
 // One reader and one writer use independent state, just like a connected UDP socket.
 type datagrams struct {
 	net.Conn
+	expiry            *time.Timer
 	next              uint32
 	partial           map[uint32]*assembly
 	readBuf, writeBuf [fragmentHeader + datagramChunk]byte
 }
 
-func newDatagrams(c net.Conn) *datagrams {
-	return &datagrams{Conn: c, partial: make(map[uint32]*assembly)}
+func newDatagrams(c net.Conn, lifetime time.Duration) *datagrams {
+	// Idle deadlines can be extended by traffic. Session key expiry is absolute.
+	return &datagrams{Conn: c, partial: make(map[uint32]*assembly),
+		expiry: time.AfterFunc(lifetime, func() { c.Close() })}
+}
+
+func (d *datagrams) Close() error {
+	d.expiry.Stop()
+	return d.Conn.Close()
 }
 
 func (d *datagrams) Write(p []byte) (int, error) {
@@ -126,7 +136,7 @@ func dialNativeUDP(ctx context.Context, addr *net.UDPAddr, keys *Keys, rule uint
 		c.Close()
 		return nil, err
 	}
-	return &nativeUDP{datagrams: newDatagrams(c), rule: rule}, nil
+	return &nativeUDP{datagrams: newDatagrams(c, nativeSessionLifetime), rule: rule}, nil
 }
 func (u *nativeUDP) Send(p []byte) error {
 	u.wbuf = binary.BigEndian.AppendUint32(u.wbuf[:0], u.rule)
@@ -203,7 +213,7 @@ func (l *NativeListener) serve(c *dtls.Conn, open func(netip.AddrPort, uint32) (
 	}
 	peer := c.RemoteAddr().(*net.UDPAddr).AddrPort()
 	peer = netip.AddrPortFrom(peer.Addr().Unmap(), peer.Port())
-	p := &authenticatedPeer{newDatagrams(c), peer}
+	p := &authenticatedPeer{newDatagrams(c, nativeSessionLifetime), peer}
 	var bound uint32
 	r := relay.UDPRelay{Conn: p, MaxSessions: 1, Open: open, Decode: func(b []byte) ([]byte, uint32, bool) {
 		if len(b) < 4 {

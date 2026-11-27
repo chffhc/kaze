@@ -30,6 +30,7 @@ const (
 const (
 	dialTimeout      = 6 * time.Second
 	handshakeTimeout = 10 * time.Second
+	ekmSize          = 32
 	ekmLabel         = "EXPORTER-kaze-tunnel-auth"
 	wsBufSize        = 64 * 1024
 )
@@ -52,19 +53,18 @@ var fingerprints = map[string]utls.ClientHelloID{
 	"firefox": utls.HelloFirefox_Auto,
 	"safari":  utls.HelloSafari_Auto,
 	"ios":     utls.HelloIOS_Auto,
-	"android": utls.HelloAndroid_11_OkHttp,
 	"edge":    utls.HelloEdge_Auto,
 	"qq":      utls.HelloQQ_Auto,
 }
 
 // Fingerprints 返回支持的指纹名称(固定顺序,供界面展示)。
 func Fingerprints() []string {
-	return []string{"chrome", "firefox", "safari", "ios", "android", "edge", "qq"}
+	return []string{"chrome", "firefox", "safari", "ios", "edge", "qq"}
 }
 
 // ValidFingerprint 报告指纹名称是否合法;空字符串表示不伪装。
 func ValidFingerprint(fp string) bool {
-	if fp == "" || fp == "360" {
+	if fp == "" || fp == "360" || fp == "android" {
 		return true
 	}
 	_, ok := fingerprints[fp]
@@ -154,23 +154,18 @@ func checkPin(certs []*x509.Certificate, pin string) error {
 }
 
 // exportEKM 返回本次 TLS 会话的导出密钥,用来把隧道鉴权绑定到这条连接上。
-func exportEKM(export func(string, []byte, int) ([]byte, error)) ([]byte, error) {
-	return export(ekmLabel, nil, 32)
-}
-
-func safeTLS(version, suite uint16) bool {
-	if version == tls.VersionTLS13 {
-		return true
+func exportEKM(version uint16, export func(string, []byte, int) ([]byte, error)) ([]byte, error) {
+	if version < tls.VersionTLS13 || export == nil {
+		return nil, errAuth
 	}
-	if version != tls.VersionTLS12 {
-		return false
+	material, err := export(ekmLabel, nil, ekmSize)
+	if err != nil {
+		return nil, err
 	}
-	switch suite {
-	case tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384, tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
-		tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256, tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384, tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256:
-		return true
+	if len(material) != ekmSize {
+		return nil, errAuth
 	}
-	return false
+	return material, nil
 }
 
 // tlsDialer 完成入口侧(以及反向隧道里出口侧)的 TLS 握手:
@@ -184,13 +179,13 @@ type tlsDialer struct {
 }
 
 func newTLSDialer(sni, pin, fp string, alpn []string) *tlsDialer {
-	if fp == "360" {
+	if fp == "360" || fp == "android" {
 		fp = ""
-	} // Legacy configs use Go TLS in place of the obsolete preset.
+	} // Use standard TLS for legacy TLS 1.2 presets.
 	d := &tlsDialer{sni: sni, pin: pin, fp: fp, alpn: alpn}
 	d.std = &tls.Config{
 		ServerName:         sni,
-		MinVersion:         tls.VersionTLS12,
+		MinVersion:         tls.VersionTLS13,
 		NextProtos:         alpn,
 		ClientSessionCache: tls.NewLRUClientSessionCache(128),
 	}
@@ -220,10 +215,7 @@ func (d *tlsDialer) handshake(ctx context.Context, raw net.Conn, endpoint string
 			return nil, nil, err
 		}
 		cs := tc.ConnectionState()
-		if !safeTLS(cs.Version, cs.CipherSuite) {
-			return nil, nil, errAuth
-		}
-		ekm, err := exportEKM(cs.ExportKeyingMaterial)
+		ekm, err := exportEKM(cs.Version, cs.ExportKeyingMaterial)
 		return tc, ekm, err
 	}
 
@@ -234,6 +226,8 @@ func (d *tlsDialer) handshake(ctx context.Context, raw net.Conn, endpoint string
 	exts := spec.Extensions[:0]
 	for _, e := range spec.Extensions {
 		switch x := e.(type) {
+		case *utls.SupportedVersionsExtension:
+			x.Versions = []uint16{tls.VersionTLS13}
 		case *utls.SNIExtension:
 			if name == "" {
 				continue // 没有服务器名:不发送 SNI 扩展
@@ -249,20 +243,9 @@ func (d *tlsDialer) handshake(ctx context.Context, raw net.Conn, endpoint string
 		exts = append(exts, e)
 	}
 	spec.Extensions = exts
-	if spec.TLSVersMax == 0 {
-		spec.TLSVersMax = tls.VersionTLS12
-		for _, ext := range spec.Extensions {
-			if versions, ok := ext.(*utls.SupportedVersionsExtension); ok {
-				for _, v := range versions.Versions {
-					if v == tls.VersionTLS13 {
-						spec.TLSVersMax = v
-					}
-				}
-			}
-		}
-	}
-	spec.TLSVersMin = max(spec.TLSVersMin, tls.VersionTLS12)
-	cfg := &utls.Config{ServerName: name, MinVersion: tls.VersionTLS12}
+	spec.TLSVersMin = tls.VersionTLS13
+	spec.TLSVersMax = tls.VersionTLS13
+	cfg := &utls.Config{ServerName: name, MinVersion: tls.VersionTLS13}
 	if d.pin != "" {
 		cfg.InsecureSkipVerify = true
 		cfg.VerifyConnection = func(cs utls.ConnectionState) error { return checkPin(cs.PeerCertificates, d.pin) }
@@ -275,10 +258,7 @@ func (d *tlsDialer) handshake(ctx context.Context, raw net.Conn, endpoint string
 		return nil, nil, err
 	}
 	cs := uc.ConnectionState()
-	if !safeTLS(cs.Version, cs.CipherSuite) {
-		return nil, nil, errAuth
-	}
-	ekm, err := exportEKM(cs.ExportKeyingMaterial)
+	ekm, err := exportEKM(cs.Version, cs.ExportKeyingMaterial)
 	return uc, ekm, err
 }
 

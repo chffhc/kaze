@@ -156,7 +156,7 @@ const AdminUsersPage = {
 };
 
 // ---- 设备组与节点 ----
-const fingerprints = ['chrome', 'firefox', 'safari', 'ios', 'android', 'edge', 'qq'];
+const fingerprints = ['chrome', 'firefox', 'safari', 'ios', 'edge', 'qq'];
 const groupTypeText = { in: '入口组', out: '出口组', chain: '链式出口' };
 
 function blankGroup(type) {

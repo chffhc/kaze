@@ -69,21 +69,13 @@ func revPrefaceGroup(p []byte) (int64, bool) {
 	return int64(binary.BigEndian.Uint64(p[4:12])), true
 }
 
-func verifyRevPreface(p []byte, k *Keys, ekm []byte, now time.Time, rc *replayCache) error {
+func verifyRevPreface(p []byte, k *Keys, ekm []byte) error {
+	if len(p) != revPrefaceLen || len(ekm) != ekmSize {
+		return errAuth
+	}
 	head, mac := p[:revPrefaceLen-32], p[revPrefaceLen-32:]
 	if !hmac.Equal(mac, revMAC(k, head, ekm)) {
 		return errAuth
-	}
-	if len(ekm) == 0 {
-		ts := time.UnixMilli(int64(binary.BigEndian.Uint64(p[12:20])))
-		if d := now.Sub(ts); d > authWindow || d < -authWindow {
-			return errClock
-		}
-		var nonce [16]byte
-		copy(nonce[:], p[20:36])
-		if !rc.check(nonce, now) {
-			return errReplay
-		}
 	}
 	return nil
 }
@@ -91,8 +83,6 @@ func verifyRevPreface(p []byte, k *Keys, ekm []byte, now time.Time, rc *replayCa
 // ReverseListener 运行在入口节点上,接受出口拨入的反向连接。
 type ReverseListener struct {
 	ln     net.Listener
-	now    func() time.Time
-	rc     replayCache
 	cert   atomic.Pointer[tls.Certificate]
 	tlsCfg *tls.Config
 
@@ -129,20 +119,17 @@ func (rs *revSess) drain() {
 }
 
 // NewReverseListener 开始监听。证书与允许的出口组稍后通过 Update 设置,在那之前所有连接都会被拒绝。
-func NewReverseListener(bind string, port int, now func() time.Time) (*ReverseListener, error) {
-	if now == nil {
-		now = time.Now
-	}
+func NewReverseListener(bind string, port int) (*ReverseListener, error) {
 	ln, err := net.Listen("tcp", net.JoinHostPort(bind, fmt.Sprint(port)))
 	if err != nil {
 		return nil, err
 	}
 	l := &ReverseListener{
-		ln: ln, now: now,
+		ln:     ln,
 		groups: map[int64]*Keys{}, sess: map[int64][]*revSess{}, pend: map[net.Conn]struct{}{},
 	}
 	l.tlsCfg = &tls.Config{
-		MinVersion: tls.VersionTLS12,
+		MinVersion: tls.VersionTLS13,
 		NextProtos: []string{"h2", "http/1.1"},
 		GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
 			if c := l.cert.Load(); c != nil {
@@ -243,10 +230,7 @@ func (l *ReverseListener) handle(c net.Conn) {
 		return
 	}
 	cs := tc.ConnectionState()
-	if !safeTLS(cs.Version, cs.CipherSuite) {
-		return
-	}
-	ekm, err := exportEKM(cs.ExportKeyingMaterial)
+	ekm, err := exportEKM(cs.Version, cs.ExportKeyingMaterial)
 	if err != nil {
 		return
 	}
@@ -269,7 +253,7 @@ func (l *ReverseListener) handle(c net.Conn) {
 		l.warn(c.RemoteAddr(), fmt.Errorf("出口组 #%d 不在本入口的反向隧道名单里", gid))
 		return
 	}
-	if err := verifyRevPreface(pre[:], keys, ekm, l.now(), &l.rc); err != nil {
+	if err := verifyRevPreface(pre[:], keys, ekm); err != nil {
 		l.warn(c.RemoteAddr(), err)
 		return
 	}

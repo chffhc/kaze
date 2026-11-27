@@ -86,7 +86,7 @@ type TunnelSpec struct {
 	Fallback   *TunnelSpec `json:"fallback,omitempty"` // 故障转移组
 
 	// Fingerprint 让 tls / wss 的 ClientHello 模拟指定浏览器(utls):
-	// chrome / firefox / safari / ios / android / edge / 360 / qq;为空则使用 Go 自身的握手特征。
+	// chrome / firefox / safari / ios / edge / qq;为空则使用 Go 自身的握手特征。
 	Fingerprint string `json:"fp,omitempty"`
 	// Reverse 表示这条隧道由出口主动拨入(反向隧道):入口不再连接 Endpoints,而是在出口保持的连接上开流。
 	Reverse bool `json:"reverse,omitempty"`

@@ -172,7 +172,7 @@ func TestTrafficRebindPreservesOldBatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer b.close()
-	if b.report() != nil || b.state.Stream == stream || !b.rebound {
+	if b.report() != nil || b.state.Stream == stream {
 		t.Fatal("old report was carried over")
 	}
 	archive, err := os.ReadFile(b.path + "." + stream + ".bak")
@@ -213,5 +213,52 @@ func TestTrafficTokenRotationKeepsSameGroupBatch(t *testing.T) {
 	report := b.report()
 	if report == nil || report.Stream != next.Stream || report.Seq != next.Seq {
 		t.Fatal("same group batch was not preserved")
+	}
+}
+
+func TestEmptyTrafficTokenRotation(t *testing.T) {
+	opt := Options{StateDir: t.TempDir(), PanelURL: "https://fixture.invalid", Token: "old"}
+	b, err := openTraffic(opt, "node")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.bindGroup(opt, "node", 9); err != nil {
+		t.Fatal(err)
+	}
+	oldStream := b.state.Stream
+	oldOwner := b.state.Owner
+	b.close()
+	opt.Token = "fresh"
+	dir, err := openTrafficDir(opt.StateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = loadTraffic(opt, "node", dir, func() error { return os.ErrPermission })
+	dir.Close()
+	if !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("rebound with stale cache: %v", err)
+	}
+	prior := opt
+	prior.Token = "old"
+	b, err = openTraffic(prior, "node")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.close()
+	if b.state.Owner != oldOwner || b.state.Stream != oldStream {
+		t.Fatal("failed rebind replaced the outbox")
+	}
+	for i := 0; i < 2; i++ {
+		b, err = openTraffic(opt, "node")
+		if err != nil {
+			t.Fatal(err)
+		}
+		b.close()
+		if b.awaitingGroup || b.state.Owner != trafficOwner(opt, "node") || b.state.Stream == oldStream || b.state.GroupID != 0 {
+			t.Fatal("empty outbox did not persist its new identity")
+		}
+	}
+	if _, err := os.Stat(b.path + "." + oldStream + ".bak"); !os.IsNotExist(err) {
+		t.Fatalf("unexpected archive: %v", err)
 	}
 }

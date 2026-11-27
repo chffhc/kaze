@@ -43,7 +43,6 @@ type trafficState struct {
 }
 
 type trafficBox struct {
-	rebound       bool
 	awaitingGroup bool
 	mu            sync.Mutex
 	path          string
@@ -74,7 +73,7 @@ func openTraffic(opt Options, uid string) (*trafficBox, error) {
 	if err != nil {
 		return nil, err
 	}
-	b, err := loadTraffic(opt, uid, d)
+	b, err := loadTraffic(opt, uid, d, nil)
 	if err != nil {
 		d.Close()
 	}
@@ -98,7 +97,7 @@ func (b *trafficBox) reset(owner string) error {
 	return b.flush()
 }
 
-func loadTraffic(opt Options, uid string, d *os.File) (*trafficBox, error) {
+func loadTraffic(opt Options, uid string, d *os.File, beforeRebind func() error) (*trafficBox, error) {
 	b := &trafficBox{path: filepath.Join(opt.StateDir, trafficName), dir: d, write: writeTrafficAtomic}
 	owner := trafficOwner(opt, uid)
 	info, err := os.Lstat(b.path)
@@ -148,8 +147,13 @@ func loadTraffic(opt Options, uid string, d *os.File) (*trafficBox, error) {
 		}
 	}
 	if s.Owner != owner {
-		b.rebound = true
-		if s.Scope == trafficScope(opt, uid) && s.GroupID > 0 {
+		// Invalidate the old offline configuration before publishing the new owner.
+		if beforeRebind != nil {
+			if err := beforeRebind(); err != nil {
+				return nil, err
+			}
+		}
+		if (len(s.Pending) != 0 || len(s.Buffer) != 0) && s.Scope == trafficScope(opt, uid) && s.GroupID > 0 {
 			// Wait for an authenticated configuration to confirm group identity.
 			b.awaitingGroup = true
 		} else {
