@@ -27,7 +27,7 @@ type ServerConfig struct {
 	Transport string
 	Keys      *Keys
 	Cert      *tls.Certificate // tls / wss 必填
-	Path      string           // ws 路径
+	Path      string           // ws / http 的路径
 	Now       func() time.Time
 }
 
@@ -59,7 +59,7 @@ func NewServer(cfg ServerConfig, h Handler) (*Server, error) {
 		cfg.Path = "/"
 	}
 	s := &Server{cfg: cfg, h: h, conns: make(map[net.Conn]struct{})}
-	useTLS := cfg.Transport == TransportTLS || cfg.Transport == TransportWSS
+	useTLS := TransportUsesTLS(cfg.Transport)
 	if useTLS {
 		if cfg.Cert == nil {
 			return nil, errors.New("tls/wss 传输层缺少证书")
@@ -77,7 +77,7 @@ func NewServer(cfg ServerConfig, h Handler) (*Server, error) {
 	}
 	s.ln = ln
 	switch cfg.Transport {
-	case TransportTCP, TransportTLS:
+	case TransportTCP, TransportTLS, TransportHTTP:
 		go s.acceptLoop()
 	default:
 		s.hs = &http.Server{
@@ -144,24 +144,36 @@ func (s *Server) acceptLoop() {
 }
 
 func (s *Server) handleRaw(c net.Conn) {
-	var conn net.Conn = c
-	var ekm []byte
-	if s.tlsCfg != nil {
+	if !s.track(c) {
+		c.Close()
+		return
+	}
+	defer s.untrack(c)
+	defer c.Close()
+
+	switch {
+	case s.cfg.Transport == TransportHTTP:
+		conn, flags, err := acceptHTTP(c, s.cfg.Keys, s.cfg.Path, s.cfg.Now(), &s.rc)
+		if err != nil {
+			if errors.Is(err, errAuth) || errors.Is(err, errClock) || errors.Is(err, errReplay) {
+				s.warn(c.RemoteAddr(), err)
+			}
+			return
+		}
+		s.serve(conn, flags)
+	case s.tlsCfg != nil:
 		tc := tls.Server(c, s.tlsCfg)
 		ctx, cancel := context.WithTimeout(context.Background(), handshakeTimeout)
 		err := tc.HandshakeContext(ctx)
 		cancel()
 		if err != nil {
-			c.Close()
 			return
 		}
-		if ekm, err = exportEKM(tc.ConnectionState()); err != nil {
-			c.Close()
-			return
-		}
-		conn = tc
+		cs := tc.ConnectionState()
+		s.authAndServe(tc, exportEKM(cs.ExportKeyingMaterial))
+	default:
+		s.authAndServe(c, nil)
 	}
-	s.handleConn(conn, ekm)
 }
 
 var upgrader = websocket.Upgrader{
@@ -177,17 +189,21 @@ func (s *Server) serveWS(w http.ResponseWriter, r *http.Request) {
 	}
 	var ekm []byte
 	if r.TLS != nil {
-		var err error
-		if ekm, err = exportEKM(*r.TLS); err != nil {
-			http.NotFound(w, r)
-			return
-		}
+		ekm = exportEKM(r.TLS.ExportKeyingMaterial)
 	}
 	wc, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return
 	}
-	s.handleConn(&wsConn{Conn: wc}, ekm)
+	// 升级后的连接已被劫持,http.Server.Close 不再管它,需要自己登记
+	conn := &wsConn{Conn: wc}
+	if !s.track(conn) {
+		conn.Close()
+		return
+	}
+	defer s.untrack(conn)
+	defer conn.Close()
+	s.authAndServe(conn, ekm)
 }
 
 func (s *Server) warn(remote net.Addr, err error) {
@@ -197,15 +213,8 @@ func (s *Server) warn(remote net.Addr, err error) {
 	}
 }
 
-// handleConn 校验前导帧,然后按是否复用分发流。
-func (s *Server) handleConn(conn net.Conn, ekm []byte) {
-	if !s.track(conn) {
-		conn.Close()
-		return
-	}
-	defer s.untrack(conn)
-	defer conn.Close()
-
+// authAndServe 读取并校验连接前导帧,通过后开始分发流。conn 由调用方负责关闭。
+func (s *Server) authAndServe(conn net.Conn, ekm []byte) {
 	var pre [prefaceLen]byte
 	conn.SetReadDeadline(time.Now().Add(handshakeTimeout))
 	if _, err := io.ReadFull(conn, pre[:]); err != nil {
@@ -217,12 +226,16 @@ func (s *Server) handleConn(conn net.Conn, ekm []byte) {
 		return
 	}
 	conn.SetReadDeadline(time.Time{})
+	s.serve(conn, flags)
+}
 
+// serve 在已通过鉴权的连接上分发流:复用连接上跑 yamux,否则整条连接就是一条流。
+func (s *Server) serve(conn net.Conn, flags byte) {
 	if flags&flagMux == 0 {
-		s.handleStream(conn)
+		serveStream(conn, s.h)
 		return
 	}
-	sess, err := yamux.Server(conn, yamuxConfig(), nil)
+	sess, err := yamux.Server(conn, yamuxConfig(true), nil)
 	if err != nil {
 		return
 	}
@@ -232,17 +245,18 @@ func (s *Server) handleConn(conn net.Conn, ekm []byte) {
 		if err != nil {
 			return
 		}
-		go s.handleStream(st)
+		go serveStream(st, s.h)
 	}
 }
 
-func (s *Server) handleStream(st net.Conn) {
+// serveStream 读取流头并交给处理函数;正向与反向隧道共用。
+func serveStream(st net.Conn, h Handler) {
 	st.SetReadDeadline(time.Now().Add(handshakeTimeout))
-	h, err := readStreamHeader(st)
+	hd, err := readStreamHeader(st)
 	if err != nil {
 		st.Close()
 		return
 	}
 	st.SetReadDeadline(time.Time{})
-	s.h(st, h)
+	h(st, hd)
 }

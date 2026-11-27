@@ -32,6 +32,9 @@ type ClientOpts struct {
 	MaxFail     int
 	FailTimeout time.Duration
 	Now         func() time.Time // 鉴权时钟(与面板校准后的时间)
+	// Reverse 是本节点的反向隧道监听。Spec.Reverse 为 true 的隧道不主动拨号,
+	// 而是在出口拨入的连接上开流;为 nil 时这类隧道不可用。
+	Reverse *ReverseListener
 }
 
 // Client 是入口侧到某个出口组的隧道客户端:
@@ -45,6 +48,7 @@ type Client struct {
 	udp      *UDPCipher
 	now      func() time.Time
 	fallback *Client
+	rev      *ReverseListener
 
 	mu      sync.Mutex
 	pools   map[*relay.Backend]*muxPool
@@ -84,20 +88,25 @@ func newClient(spec *proto.TunnelSpec, o ClientOpts, withFallback bool) (*Client
 	if c.Spec.MuxConns <= 0 {
 		c.Spec.MuxConns = 4
 	}
+	if !ValidFingerprint(spec.Fingerprint) {
+		return nil, errors.New("未知的 TLS 指纹: " + spec.Fingerprint)
+	}
 	path := spec.Path
 	if path == "" {
 		path = "/"
 	}
-	c.ds = &dialSpec{transport: spec.Transport, sni: spec.SNI, host: spec.Host, path: path, pin: spec.CertPin}
+	c.ds = &dialSpec{transport: spec.Transport, host: spec.Host, path: path, keys: keys, now: o.Now}
 	c.ds.nd = net.Dialer{Timeout: dialTimeout, KeepAlive: 30 * time.Second}
 	switch spec.Transport {
 	case TransportTLS:
-		c.ds.tlsCfg = clientTLS(spec.SNI, spec.CertPin, []string{"h2", "http/1.1"})
+		alpn := []string{"h2", "http/1.1"}
+		if spec.Fingerprint != "" {
+			alpn = nil // 保留指纹预设自带的 ALPN
+		}
+		c.ds.tls = newTLSDialer(spec.SNI, spec.CertPin, spec.Fingerprint, alpn)
 	case TransportWSS:
-		c.ds.tlsCfg = clientTLS(spec.SNI, spec.CertPin, []string{"http/1.1"})
-	}
-	for _, be := range c.bal.Backends() {
-		c.pools[be] = &muxPool{c: c, be: be}
+		// 浏览器发起 WebSocket 时只声明 http/1.1;经 CDN 时声明 h2 还会导致握手后无法升级
+		c.ds.tls = newTLSDialer(spec.SNI, spec.CertPin, spec.Fingerprint, []string{"http/1.1"})
 	}
 	if withFallback && spec.Fallback != nil {
 		if fb, err := newClient(spec.Fallback, o, false); err == nil {
@@ -105,6 +114,13 @@ func newClient(spec *proto.TunnelSpec, o ClientOpts, withFallback bool) (*Client
 		}
 	}
 	c.Spec.Fallback = spec.Fallback
+	if spec.Reverse {
+		c.rev = o.Reverse
+		return c, nil // 反向隧道的连接由出口发起并由监听端持有,这里不拨号、不预热
+	}
+	for _, be := range c.bal.Backends() {
+		c.pools[be] = &muxPool{c: c, be: be}
+	}
 	if c.Spec.Mux {
 		go c.janitor()
 	}
@@ -159,6 +175,15 @@ func (c *Client) reap(force bool) {
 // 返回的连接是原始类型(*net.TCPConn / *tls.Conn / *yamux.Stream),
 // 这样明文 tcp 隧道在入口侧也能走 splice 零拷贝。
 func (c *Client) Open(ctx context.Context, h StreamHeader) (conn net.Conn, done func(), err error) {
+	if c.Spec.Reverse {
+		if conn, err = c.openReverse(ctx, h); err == nil {
+			return conn, func() {}, nil
+		}
+		if c.fallback != nil {
+			return c.fallback.Open(ctx, h)
+		}
+		return nil, nil, err
+	}
 	if c.fallback != nil && c.bal.AllDown() {
 		return c.fallback.Open(ctx, h)
 	}
@@ -181,15 +206,35 @@ func (c *Client) Open(ctx context.Context, h StreamHeader) (conn net.Conn, done 
 	return nil, nil, err
 }
 
+// openReverse 在出口拨入的反向连接上开一条流。
+func (c *Client) openReverse(ctx context.Context, h StreamHeader) (net.Conn, error) {
+	if c.rev == nil {
+		return nil, errors.New("本节点没有开启反向隧道监听(启动时未指定 -rev-port)")
+	}
+	st, err := c.rev.Open(ctx, c.Spec.GroupID)
+	if err != nil {
+		return nil, err
+	}
+	var hb [maxStreamHeader]byte
+	st.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	_, err = st.Write(appendStreamHeader(hb[:0], h))
+	st.SetWriteDeadline(time.Time{})
+	if err != nil {
+		relay.Abort(st)
+		return nil, err
+	}
+	return st, nil
+}
+
 func (c *Client) openOn(ctx context.Context, be *relay.Backend, h StreamHeader) (net.Conn, error) {
-	var hb [prefaceLen + 32]byte
+	var hb [prefaceLen + maxStreamHeader]byte
 	if !c.Spec.Mux {
-		conn, ekm, err := c.ds.dial(ctx, be.Addr)
+		conn, buf, err := c.ds.dial(ctx, be.Addr, 0, hb[:0])
 		c.bal.Report(be, err == nil)
 		if err != nil {
 			return nil, err
 		}
-		buf := appendPreface(hb[:0], c.keys, 0, ekm, c.now())
+		// 前导帧与流头合在一次写里发出,之后立刻可以转发数据(0-RTT)
 		buf = appendStreamHeader(buf, h)
 		conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 		_, err = conn.Write(buf)
@@ -226,10 +271,11 @@ func (c *Client) openOn(ctx context.Context, be *relay.Backend, h StreamHeader) 
 	return nil, last
 }
 
-// OpenUDP 为一个 UDP 会话建立上游:默认走原生 UDP 加密通道,
-// UDPOverTCP 或 WebSocket 传输层下改为封装进隧道流。
-func (c *Client) OpenUDP(ctx context.Context, ruleID uint32, src netip.AddrPort) (relay.Upstream, error) {
-	if c.Spec.UDPOverTCP || c.Spec.Transport == TransportWS || c.Spec.Transport == TransportWSS {
+// OpenUDP 为一个 UDP 会话建立上游:默认走原生 UDP 加密通道;
+// 以下情况改为封装进隧道流(UDP over TCP):出口组如此配置、WebSocket 传输层、反向隧道,
+// 或调用方要求(forceStream,链式出口的中间跳只转发流)。
+func (c *Client) OpenUDP(ctx context.Context, ruleID uint32, src netip.AddrPort, forceStream bool) (relay.Upstream, error) {
+	if forceStream || c.Spec.Reverse || c.Spec.UDPOverTCP || c.Spec.Transport == TransportWS || c.Spec.Transport == TransportWSS {
 		conn, done, err := c.Open(ctx, StreamHeader{Cmd: CmdUDP, RuleID: ruleID, Src: src})
 		if err != nil {
 			return nil, err
@@ -237,7 +283,7 @@ func (c *Client) OpenUDP(ctx context.Context, ruleID uint32, src netip.AddrPort)
 		return &streamUDP{StreamUpstream: relay.NewStreamUpstream(conn), done: done}, nil
 	}
 	if c.fallback != nil && c.bal.AllDown() {
-		return c.fallback.OpenUDP(ctx, ruleID, src)
+		return c.fallback.OpenUDP(ctx, ruleID, src, false)
 	}
 	cands := c.bal.Candidates(0)
 	if len(cands) == 0 {
@@ -254,8 +300,25 @@ func (c *Client) OpenUDP(ctx context.Context, ruleID uint32, src netip.AddrPort)
 	return &nativeUDP{UDPConn: uc, c: c.udp, ruleID: ruleID}, nil
 }
 
-// Endpoints 返回出口节点地址列表(诊断用)。
-func (c *Client) Endpoints() []string { return c.Spec.Endpoints }
+// Endpoints 返回出口节点地址列表(诊断用);反向隧道没有可拨的地址。
+func (c *Client) Endpoints() []string {
+	if c.Spec.Reverse {
+		return nil
+	}
+	return c.Spec.Endpoints
+}
+
+// ReverseStatus 返回反向隧道当前的连接数与往返时延(诊断用)。
+func (c *Client) ReverseStatus() (reverse bool, conns int, rtt time.Duration, err error) {
+	if !c.Spec.Reverse {
+		return false, 0, 0, nil
+	}
+	if c.rev == nil {
+		return true, 0, 0, errors.New("本节点没有开启反向隧道监听")
+	}
+	conns, rtt, err = c.rev.Ping(c.Spec.GroupID)
+	return true, conns, rtt, err
+}
 
 // Retire 让客户端退役:不再预热,已有的流继续跑完,空闲的复用连接被逐步回收。
 func (c *Client) Retire() {
@@ -401,19 +464,21 @@ func (p *muxPool) dialSession() (*muxSess, error) {
 	c := p.c
 	ctx, cancel := context.WithTimeout(context.Background(), handshakeTimeout)
 	defer cancel()
-	conn, ekm, err := c.ds.dial(ctx, p.be.Addr)
+	conn, preface, err := c.ds.dial(ctx, p.be.Addr, flagMux, nil)
 	c.bal.Report(p.be, err == nil)
 	if err != nil {
 		return nil, err
 	}
-	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-	_, err = conn.Write(appendPreface(nil, c.keys, flagMux, ekm, c.now()))
-	conn.SetWriteDeadline(time.Time{})
-	if err != nil {
-		conn.Close()
-		return nil, err
+	if len(preface) > 0 {
+		conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		_, err = conn.Write(preface)
+		conn.SetWriteDeadline(time.Time{})
+		if err != nil {
+			conn.Close()
+			return nil, err
+		}
 	}
-	s, err := yamux.Client(conn, yamuxConfig(), nil)
+	s, err := yamux.Client(conn, yamuxConfig(false), nil)
 	if err != nil {
 		conn.Close()
 		return nil, err

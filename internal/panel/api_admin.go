@@ -2,7 +2,9 @@ package panel
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -256,6 +258,16 @@ func (s *Server) handleAdminUserDelete(w http.ResponseWriter, r *http.Request, u
 		s.fail(w, 400, "不能删除自己")
 		return
 	}
+	s.ruleMu.Lock()
+	defer s.ruleMu.Unlock()
+	// 管理员名下的共享 TLS 端口还挂着别人的子规则时,不能连带删掉
+	var orphans int
+	s.db.QueryRow(`SELECT COUNT(*) FROM rules c JOIN rules p ON p.in_group=c.in_group AND p.listen_port=c.listen_port AND p.tls_mode='parent'
+		WHERE c.tls_mode='child' AND p.user_id=? AND c.user_id<>?`, id, id).Scan(&orphans)
+	if orphans > 0 {
+		s.fail(w, 400, fmt.Sprintf("该用户创建的共享 TLS 端口下还有其他用户的 %d 条子规则,请先处理这些规则", orphans))
+		return
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		s.dbErr(w, err)
@@ -283,9 +295,12 @@ type adminGroupView struct {
 	InstallCmd string `json:"install_cmd"`
 }
 
-func (s *Server) installCmd(r *http.Request, token string) string {
+func (s *Server) installCmd(r *http.Request, g *Group) string {
+	if g.Type == proto.RoleChain {
+		return "" // 链式出口没有自己的机器
+	}
 	base := s.baseURL(r)
-	return fmt.Sprintf("bash <(curl -fsSL %s/install.sh) -u %s -t %s", base, base, token)
+	return fmt.Sprintf("bash <(curl -fsSL %s/install.sh) -u %s -t %s", base, base, g.Token)
 }
 
 func (s *Server) handleAdminGroups(w http.ResponseWriter, r *http.Request, u *User) {
@@ -294,6 +309,7 @@ func (s *Server) handleAdminGroups(w http.ResponseWriter, r *http.Request, u *Us
 		s.dbErr(w, err)
 		return
 	}
+	gs := toGroupSet(groups)
 	online := s.hub.onlineCount()
 	count := func(q string) map[int64]int {
 		m := map[int64]int{}
@@ -313,10 +329,20 @@ func (s *Server) handleAdminGroups(w http.ResponseWriter, r *http.Request, u *Us
 	ruleOut := count(`SELECT out_group, COUNT(*) FROM rules WHERE out_group<>0 GROUP BY out_group`)
 	out := []adminGroupView{}
 	for _, g := range groups {
-		out = append(out, adminGroupView{
+		v := adminGroupView{
 			Group: g, Online: online[g.ID], NodeCount: nodeN[g.ID], RuleCount: ruleIn[g.ID] + ruleOut[g.ID],
-			InstallCmd: s.installCmd(r, g.Token),
-		})
+			InstallCmd: s.installCmd(r, g),
+		}
+		if g.Type == proto.RoleChain {
+			// 在线数取各跳里最少的;链路不完整时为 0
+			if hops, _, ok := gs.hops(g.ID); ok {
+				v.Online = online[hops[0].ID]
+				for _, hg := range hops[1:] {
+					v.Online = min(v.Online, online[hg.ID])
+				}
+			}
+		}
+		out = append(out, v)
 	}
 	s.ok(w, out)
 }
@@ -333,73 +359,186 @@ type groupInput struct {
 
 var wsPathRe = regexp.MustCompile(`^/[A-Za-z0-9/_.~-]*$`)
 
-// normalizeGroup 校验设备组配置并补全默认值;old 非空时沿用原有的密钥材料。
-func normalizeGroup(in *groupInput, old *Group) error {
+func randomHostname() string { return "www." + strings.ToLower(randString(8)) + ".com" }
+
+func uniqueIDs(in []int64) []int64 {
+	out := []int64{}
+	for _, id := range in {
+		if id >= 0 && !containsID(out, id) {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+func trimList(in []string) []string {
+	out := []string{}
+	for _, x := range in {
+		if x = strings.ToLower(strings.TrimSpace(x)); x != "" && !containsStr(out, x) {
+			out = append(out, x)
+		}
+	}
+	return out
+}
+
+// normalizeGroup 校验设备组并补全默认值。只保留与该类型相关的配置项;
+// old 非空时沿用原有的密钥材料,gs 是现有的全部设备组(校验链式出口用)。
+func normalizeGroup(in *groupInput, old *Group, gs groupSet) error {
 	in.Name = strings.TrimSpace(in.Name)
 	if in.Name == "" || len([]rune(in.Name)) > 64 {
-		return fmt.Errorf("名称不能为空且不超过 64 个字符")
-	}
-	if in.Type != proto.RoleIn && in.Type != proto.RoleOut {
-		return fmt.Errorf("类型只能是 in(入口)或 out(出口)")
+		return errors.New("名称不能为空且不超过 64 个字符")
 	}
 	if old != nil && old.Type != in.Type {
-		return fmt.Errorf("设备组类型创建后不可更改")
+		return errors.New("设备组类型创建后不可更改")
 	}
 	if in.Ratio < 0 || in.Ratio > 1000 {
-		return fmt.Errorf("倍率无效")
+		return errors.New("倍率无效")
 	}
-	c := &in.Config
-	if c.MaxFail <= 0 {
-		c.MaxFail = 3
+	var c GroupConfig
+	var err error
+	switch in.Type {
+	case proto.RoleIn:
+		c, err = normalizeInGroup(&in.Config, old)
+	case proto.RoleOut:
+		c, err = normalizeOutGroup(&in.Config, old)
+	case proto.RoleChain:
+		c, err = normalizeChain(&in.Config, gs)
+	default:
+		return errors.New("类型只能是 in(入口)、out(出口)或 chain(链式出口)")
 	}
-	if c.FailTimeout <= 0 {
-		c.FailTimeout = 30
+	if err != nil {
+		return err
 	}
-	if in.Type == proto.RoleIn {
-		if strings.TrimSpace(c.PortRange) == "" {
-			c.PortRange = "10000-60000"
-		}
-		if _, err := parsePortRange(c.PortRange); err != nil {
-			return err
-		}
-		if c.DirectMode < 0 || c.DirectMode > 2 {
-			return fmt.Errorf("直出策略无效")
-		}
-		for _, p := range c.BlockedProtocols {
-			if p != "http" && p != "tls" && p != "socks" {
-				return fmt.Errorf("屏蔽协议只支持 http / tls / socks")
-			}
-		}
-		// 清掉与入口无关的字段
-		c.Transport, c.TunnelKey, c.CertPEM, c.KeyPEM, c.CertPin = "", "", "", "", ""
-		return nil
+	in.Config = c
+	return nil
+}
+
+// pemPair 原样返回一对证书与私钥;任何一个为空白就都当作没填。
+// 不去改动它们的文本(哪怕只是末尾的换行):节点拿证书文本判断隧道参数有没有变,变了就会重启监听。
+func pemPair(cert, key string) (string, string) {
+	if strings.TrimSpace(cert) == "" || strings.TrimSpace(key) == "" {
+		return "", ""
 	}
+	return cert, key
+}
+
+func failoverDefaults(maxFail, failTimeout int) (int, int) {
+	if maxFail <= 0 {
+		maxFail = 3
+	}
+	if failTimeout <= 0 {
+		failTimeout = 30
+	}
+	return maxFail, failTimeout
+}
+
+func normalizeInGroup(in *GroupConfig, old *Group) (GroupConfig, error) {
+	c := GroupConfig{
+		DisplayHost: strings.TrimSpace(in.DisplayHost), PortRange: strings.TrimSpace(in.PortRange), DirectMode: in.DirectMode,
+		AllowedOut: uniqueIDs(in.AllowedOut), BlockedProtocols: trimList(in.BlockedProtocols),
+		BlockedHosts: trimList(in.BlockedHosts), AllowedHosts: trimList(in.AllowedHosts),
+		DisableUDP: in.DisableUDP, AllowPrivate: in.AllowPrivate,
+		TLSInboundPolicy: in.TLSInboundPolicy, TLSRejectEmptySNI: in.TLSRejectEmptySNI,
+		ReverseGroups: uniqueIDs(in.ReverseGroups), ReverseSNI: strings.ToLower(strings.TrimSpace(in.ReverseSNI)), ReverseConns: in.ReverseConns,
+	}
+	c.RevCertPEM, c.RevKeyPEM = pemPair(in.RevCertPEM, in.RevKeyPEM)
+	c.MaxFail, c.FailTimeout = failoverDefaults(in.MaxFail, in.FailTimeout)
+	if c.PortRange == "" {
+		c.PortRange = "10000-60000"
+	}
+	if _, err := parsePortRange(c.PortRange); err != nil {
+		return c, err
+	}
+	if c.DirectMode < 0 || c.DirectMode > 2 {
+		return c, errors.New("直出策略无效")
+	}
+	for _, p := range c.BlockedProtocols {
+		if p != "http" && p != "tls" && p != "socks" {
+			return c, errors.New("屏蔽协议只支持 http / tls / socks")
+		}
+	}
+	if c.TLSInboundPolicy < 0 || c.TLSInboundPolicy > 2 {
+		return c, errors.New("TLS 入站策略只能是 0 / 1 / 2")
+	}
+	if c.TLSInboundPolicy > 0 && containsStr(c.BlockedProtocols, "tls") {
+		return c, errors.New("入站屏蔽了 TLS 协议,就不能再要求用户只建 TLS 入站规则")
+	}
+	if c.ReverseSNI != "" && !hostRe.MatchString(c.ReverseSNI) {
+		return c, errors.New("反向隧道的 SNI 无效")
+	}
+	if c.ReverseConns <= 0 {
+		c.ReverseConns = 2
+	}
+	c.ReverseConns = min(c.ReverseConns, 16)
+
+	// 反向隧道证书:沿用旧的;开启了反向隧道而还没有证书时生成一张。
+	// 出口拨入时固定校验它的指纹,所以这里不需要 CA 签发的证书。
+	if (c.RevCertPEM == "" || c.RevKeyPEM == "") && old != nil {
+		c.RevCertPEM, c.RevKeyPEM = old.Config.RevCertPEM, old.Config.RevKeyPEM
+	}
+	switch {
+	case c.RevCertPEM != "" && c.RevKeyPEM != "":
+		cert, err := tunnel.ParseCert(c.RevCertPEM, c.RevKeyPEM)
+		if err != nil {
+			return c, fmt.Errorf("反向隧道的证书或私钥无效: %v", err)
+		}
+		c.RevCertPin = tunnel.CertPin(&cert)
+	case len(c.ReverseGroups) > 0:
+		name := c.ReverseSNI
+		if name == "" {
+			name = randomHostname()
+		}
+		var err error
+		if c.RevCertPEM, c.RevKeyPEM, c.RevCertPin, err = tunnel.GenerateCert(name); err != nil {
+			return c, err
+		}
+	default:
+		c.RevCertPEM, c.RevKeyPEM = "", ""
+	}
+	return c, nil
+}
+
+func normalizeOutGroup(in *GroupConfig, old *Group) (GroupConfig, error) {
+	c := GroupConfig{
+		Transport: in.Transport, Mux: in.Mux, MuxConns: in.MuxConns, TunnelPort: in.TunnelPort,
+		ConnectHost: strings.TrimSpace(in.ConnectHost), ConnectPort: in.ConnectPort,
+		SNI: strings.ToLower(strings.TrimSpace(in.SNI)), WSHost: strings.TrimSpace(in.WSHost), WSPath: strings.TrimSpace(in.WSPath),
+		CDN: in.CDN, CDNTLS: in.CDNTLS, UDPOverTCP: in.UDPOverTCP, FailoverGroup: max(in.FailoverGroup, 0),
+		Fingerprint: strings.ToLower(strings.TrimSpace(in.Fingerprint)), AllowPrivate: in.AllowPrivate,
+		TunnelKey: strings.TrimSpace(in.TunnelKey),
+	}
+	c.CertPEM, c.KeyPEM = pemPair(in.CertPEM, in.KeyPEM)
+	c.MaxFail, c.FailTimeout = failoverDefaults(in.MaxFail, in.FailTimeout)
 	if c.Transport == "" {
 		c.Transport = tunnel.TransportTLS
 	}
 	if !tunnel.ValidTransport(c.Transport) {
-		return fmt.Errorf("传输层只能是 tcp / tls / ws / wss")
+		return c, errors.New("传输层只能是 tls / wss / ws / http / tcp")
 	}
-	if c.Transport == tunnel.TransportWS || c.Transport == tunnel.TransportWSS {
-		c.Mux = true
+	if c.Transport == tunnel.TransportWS || c.Transport == tunnel.TransportWSS || c.CDN {
+		c.Mux = true // WebSocket 没有半关闭,必须走复用层
 	}
 	if c.CDN && c.ConnectHost == "" {
-		return fmt.Errorf("CDN 模式必须填写连接地址(CDN 域名或优选 IP)")
+		return c, errors.New("CDN 模式必须填写连接地址(CDN 域名或优选 IP)")
+	}
+	if !tunnel.ValidFingerprint(c.Fingerprint) {
+		return c, errors.New("TLS 指纹只能是 " + strings.Join(tunnel.Fingerprints(), " / ") + ",或留空")
+	}
+	if c.SNI != "" && !hostRe.MatchString(c.SNI) {
+		return c, errors.New("TLS SNI 无效")
 	}
 	if c.MuxConns <= 0 {
 		c.MuxConns = 4
 	}
-	if c.MuxConns > 32 {
-		c.MuxConns = 32
-	}
+	c.MuxConns = min(c.MuxConns, 32)
 	if c.TunnelPort < 0 || c.TunnelPort > 65535 || c.ConnectPort < 0 || c.ConnectPort > 65535 {
-		return fmt.Errorf("端口无效")
+		return c, errors.New("端口无效")
 	}
 	if c.WSPath == "" {
 		c.WSPath = "/"
 	}
 	if !wsPathRe.MatchString(c.WSPath) {
-		return fmt.Errorf("WebSocket 路径无效")
+		return c, errors.New("路径无效:需以 / 开头,只能包含字母、数字和 / _ . ~ -")
 	}
 	// 密钥材料:沿用旧值,缺失则生成
 	if old != nil {
@@ -407,29 +546,70 @@ func normalizeGroup(in *groupInput, old *Group) error {
 			c.TunnelKey = old.Config.TunnelKey
 		}
 		if c.CertPEM == "" || c.KeyPEM == "" {
-			c.CertPEM, c.KeyPEM, c.CertPin = old.Config.CertPEM, old.Config.KeyPEM, old.Config.CertPin
+			c.CertPEM, c.KeyPEM = old.Config.CertPEM, old.Config.KeyPEM
 		}
 	}
 	if _, err := tunnel.DeriveKeys(c.TunnelKey); err != nil {
 		c.TunnelKey = tunnel.NewKey()
 	}
 	if c.CertPEM == "" || c.KeyPEM == "" {
-		cn := c.SNI
-		if cn == "" {
-			cn = "www." + strings.ToLower(randString(8)) + ".com"
+		name := c.SNI
+		if name == "" {
+			name = randomHostname()
 		}
 		var err error
-		if c.CertPEM, c.KeyPEM, c.CertPin, err = tunnel.GenerateCert(cn); err != nil {
-			return err
+		if c.CertPEM, c.KeyPEM, c.CertPin, err = tunnel.GenerateCert(name); err != nil {
+			return c, err
 		}
 	} else {
 		cert, err := tunnel.ParseCert(c.CertPEM, c.KeyPEM)
 		if err != nil {
-			return fmt.Errorf("证书或私钥无效: %v", err)
+			return c, fmt.Errorf("证书或私钥无效: %v", err)
 		}
-		c.CertPin = fmt.Sprintf("%x", sha256Sum(cert.Certificate[0]))
+		c.CertPin = tunnel.CertPin(&cert)
 	}
-	return nil
+	return c, nil
+}
+
+func normalizeChain(in *GroupConfig, gs groupSet) (GroupConfig, error) {
+	c := GroupConfig{ChainHops: in.ChainHops, ChainMux: in.ChainMux}
+	if n := len(c.ChainHops); n < 2 || n > 3 {
+		return c, errors.New("链式出口需要依次选择 2 到 3 个出口组")
+	}
+	for i, id := range c.ChainHops {
+		if containsID(c.ChainHops[:i], id) {
+			return c, errors.New("链式出口里同一个出口组只能出现一次")
+		}
+		if hg := gs[id]; hg == nil || hg.Type != proto.RoleOut {
+			return c, fmt.Errorf("第 %d 跳不是一个出口组", i+1)
+		}
+	}
+	return c, nil
+}
+
+// keyMaterialBase 决定修改设备组时沿用哪些原有的密钥材料。
+// 请求里没有带某一项(或原样带回)时沿用原值;明确把它写成空字符串,表示要重新生成:
+//
+//	tunnel_key   -> 出口组的隧道密钥
+//	cert_pem     -> 出口组的隧道证书与私钥
+//	rev_cert_pem -> 入口组的反向隧道证书与私钥
+func keyMaterialBase(old *Group, body []byte) *Group {
+	var raw struct {
+		Config map[string]json.RawMessage `json:"config"`
+	}
+	json.Unmarshal(body, &raw)
+	emptied := func(k string) bool { return strings.TrimSpace(string(raw.Config[k])) == `""` }
+	base := *old
+	if emptied("tunnel_key") {
+		base.Config.TunnelKey = ""
+	}
+	if emptied("cert_pem") {
+		base.Config.CertPEM, base.Config.KeyPEM = "", ""
+	}
+	if emptied("rev_cert_pem") {
+		base.Config.RevCertPEM, base.Config.RevKeyPEM = "", ""
+	}
+	return &base
 }
 
 func (s *Server) handleAdminGroupCreate(w http.ResponseWriter, r *http.Request, u *User) {
@@ -440,7 +620,12 @@ func (s *Server) handleAdminGroupCreate(w http.ResponseWriter, r *http.Request, 
 		s.fail(w, 400, err.Error())
 		return
 	}
-	if err := normalizeGroup(&in, nil); err != nil {
+	all, err := listGroups(s.db)
+	if err != nil {
+		s.dbErr(w, err)
+		return
+	}
+	if err := normalizeGroup(&in, nil, toGroupSet(all)); err != nil {
 		s.fail(w, 400, err.Error())
 		return
 	}
@@ -452,8 +637,12 @@ func (s *Server) handleAdminGroupCreate(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 	id, _ := res.LastInsertId()
-	g, _ := getGroup(s.db, id)
-	s.ok(w, adminGroupView{Group: g, InstallCmd: s.installCmd(r, g.Token)})
+	g, err := getGroup(s.db, id)
+	if err != nil {
+		s.dbErr(w, err)
+		return
+	}
+	s.ok(w, adminGroupView{Group: g, InstallCmd: s.installCmd(r, g)})
 }
 
 func (s *Server) handleAdminGroupUpdate(w http.ResponseWriter, r *http.Request, u *User) {
@@ -462,15 +651,21 @@ func (s *Server) handleAdminGroupUpdate(w http.ResponseWriter, r *http.Request, 
 		s.dbErr(w, err)
 		return
 	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 4<<20))
 	var in groupInput
-	if err := bind(r, &in); err != nil {
-		s.fail(w, 400, err.Error())
+	if err != nil || json.Unmarshal(body, &in) != nil {
+		s.fail(w, 400, "请求格式错误")
 		return
 	}
 	if in.Type == "" {
 		in.Type = old.Type
 	}
-	if err := normalizeGroup(&in, old); err != nil {
+	all, err := listGroups(s.db)
+	if err != nil {
+		s.dbErr(w, err)
+		return
+	}
+	if err := normalizeGroup(&in, keyMaterialBase(old, body), toGroupSet(all)); err != nil {
 		s.fail(w, 400, err.Error())
 		return
 	}
@@ -489,12 +684,25 @@ func (s *Server) handleAdminGroupUpdate(w http.ResponseWriter, r *http.Request, 
 
 func (s *Server) handleAdminGroupDelete(w http.ResponseWriter, r *http.Request, u *User) {
 	id := pathID(r)
+	all, err := listGroups(s.db)
+	if err != nil {
+		s.dbErr(w, err)
+		return
+	}
+	for _, g := range all {
+		if g.Type == proto.RoleChain && containsID(g.Config.ChainHops, id) {
+			s.fail(w, 400, fmt.Sprintf("链式出口「%s」经过这个出口组,请先修改或删除它", g.Name))
+			return
+		}
+	}
 	var n int
 	s.db.QueryRow(`SELECT COUNT(*) FROM rules WHERE in_group=? OR out_group=?`, id, id).Scan(&n)
 	if n > 0 && r.URL.Query().Get("force") != "1" {
 		s.fail(w, http.StatusConflict, fmt.Sprintf("该设备组下还有 %d 条规则,确认后将一并删除", n))
 		return
 	}
+	s.ruleMu.Lock()
+	defer s.ruleMu.Unlock()
 	tx, err := s.db.Begin()
 	if err != nil {
 		s.dbErr(w, err)
@@ -514,19 +722,22 @@ func (s *Server) handleAdminGroupDelete(w http.ResponseWriter, r *http.Request, 
 }
 
 func (s *Server) handleAdminGroupResetToken(w http.ResponseWriter, r *http.Request, u *User) {
-	id := pathID(r)
-	tok := randHex(20)
-	res, err := s.db.Exec(`UPDATE device_groups SET token=? WHERE id=?`, tok, id)
+	g, err := getGroup(s.db, pathID(r))
 	if err != nil {
 		s.dbErr(w, err)
 		return
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		s.fail(w, 404, "设备组不存在")
+	if g.Type == proto.RoleChain {
+		s.fail(w, 400, "链式出口没有对接令牌")
 		return
 	}
-	s.hub.kickGroup(id)
-	s.ok(w, H{"token": tok, "install_cmd": s.installCmd(r, tok)})
+	g.Token = randHex(20)
+	if _, err := s.db.Exec(`UPDATE device_groups SET token=? WHERE id=?`, g.Token, g.ID); err != nil {
+		s.dbErr(w, err)
+		return
+	}
+	s.hub.kickGroup(g.ID)
+	s.ok(w, H{"token": g.Token, "install_cmd": s.installCmd(r, g)})
 }
 
 // ---- 节点 ----
@@ -540,10 +751,11 @@ func (s *Server) handleAdminNodes(w http.ResponseWriter, r *http.Request, u *Use
 	type view struct {
 		*Node
 		NodeStatus
+		Outdated bool `json:"outdated"` // 节点端版本低于面板:新功能在这台机器上不可用
 	}
 	out := []view{}
 	for _, n := range nodes {
-		out = append(out, view{Node: n, NodeStatus: s.hub.status(n.GroupID, n.UID)})
+		out = append(out, view{Node: n, NodeStatus: s.hub.status(n.GroupID, n.UID), Outdated: !versionAtLeast(n.Version, proto.Version)})
 	}
 	s.ok(w, out)
 }

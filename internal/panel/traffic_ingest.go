@@ -78,12 +78,15 @@ func (h *Hub) ingest(gid int64, uid string, rep *proto.Report) error {
 			return err
 		}
 		var ratio float64
+		var hopJSON string
 		var n int
 		expected := int64(1)
 		if out != 0 && out != gid {
 			expected++
 		}
-		if err = tx.QueryRow(`SELECT COUNT(*),SUM(ratio) FROM device_groups WHERE id=? OR (id=? AND ?<>0)`, gid, out, out).Scan(&n, &ratio); err != nil {
+		if err = tx.QueryRow(`SELECT COUNT(*), SUM(ratio),
+			COALESCE(MAX(CASE WHEN id=? AND type='chain' THEN json_extract(config,'$.chain_hops') END), '[]')
+			FROM device_groups WHERE id=? OR (id=? AND ?<>0)`, out, gid, out, out).Scan(&n, &ratio, &hopJSON); err != nil {
 			return err
 		}
 		charge := float64(raw) * ratio
@@ -107,6 +110,17 @@ func (h *Hub) ingest(gid int64, uid string, rep *proto.Report) error {
 		}
 		if err = trafficWrite(tx, expected, `UPDATE device_groups SET traffic=traffic+? WHERE (id=? OR (id=? AND ?<>0)) AND traffic<=?`, raw, gid, out, out, math.MaxInt64-raw); err != nil {
 			return err
+		}
+		if hopJSON != "[]" {
+			var hops []int64
+			if err := json.Unmarshal([]byte(hopJSON), &hops); err != nil {
+				return err
+			}
+			for _, hop := range hops {
+				if err := trafficWrite(tx, 1, `UPDATE device_groups SET traffic=traffic+? WHERE id=? AND type='out' AND traffic<=?`, raw, hop, math.MaxInt64-raw); err != nil {
+					return err
+				}
+			}
 		}
 	}
 	if err = trafficWrite(tx, 1, `INSERT INTO traffic_cursors(group_id,uid,stream,seq,digest) VALUES(?,?,?,?,?) ON CONFLICT(group_id,uid,stream) DO UPDATE SET seq=excluded.seq,digest=excluded.digest`, gid, uid, rep.Stream, rep.Seq, digest[:]); err != nil {

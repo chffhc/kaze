@@ -143,3 +143,23 @@ func TestConcurrentRuleQuota(t *testing.T) {
 		t.Errorf("successes %d stored %d", ok, count)
 	}
 }
+
+func TestTLSChildChainPolicy(t *testing.T) {
+	in := &Group{ID: 1, Type: proto.RoleIn, Public: true, Config: GroupConfig{TLSInboundPolicy: 2, PortRange: "20000", AllowedHosts: []string{".example.org"}}}
+	chain := &Group{ID: 4, Type: proto.RoleChain, Config: GroupConfig{ChainHops: []int64{2, 3}}}
+	p := &rulePolicy{groups: groupSet{1: in, 2: {ID: 2, Type: proto.RoleOut}, 3: {ID: 3, Type: proto.RoleOut}, 4: chain}, plans: map[int64][]int64{1: {4}}}
+	owner := &User{PlanID: 1}
+	r := Rule{InGroup: 1, OutGroup: 4, ListenPort: 443, TLSMode: proto.TLSModeChild, TLS: RuleTLS{SNI: []string{"a.example.org"}}}
+	if err := p.authorize(owner, &r); err != nil {
+		t.Fatal(err)
+	}
+	delete(p.plans, 1)
+	if p.authorize(owner, &r) == nil {
+		t.Fatal("revoked chain still allowed")
+	}
+	p.plans[1] = []int64{4}
+	in.Config.BlockedHosts = []string{".example.org"}
+	if p.authorize(owner, &r) == nil {
+		t.Fatal("blocked child SNI still allowed")
+	}
+}

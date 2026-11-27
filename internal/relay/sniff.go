@@ -93,14 +93,17 @@ func (p *SniffPolicy) verdict(b []byte) bool {
 			return false
 		}
 	}
+	return p.HostAllowed(host)
+}
+
+// HostAllowed 按域名黑白名单裁决一个主机名(首包里嗅探到的,或 TLS 入站握手中的 SNI)。
+// 配置了白名单时,没有主机名的连接一律不放行。
+func (p *SniffPolicy) HostAllowed(host string) bool {
 	host = strings.ToLower(host)
 	if len(p.AllowedHosts) > 0 {
 		return host != "" && matchSuffix(host, p.AllowedHosts)
 	}
-	if host != "" && matchSuffix(host, p.BlockedHosts) {
-		return false
-	}
-	return true
+	return host == "" || !matchSuffix(host, p.BlockedHosts)
 }
 
 func matchSuffix(host string, list []string) bool {

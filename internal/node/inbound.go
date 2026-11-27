@@ -2,11 +2,15 @@ package node
 
 import (
 	"context"
+	"crypto/tls"
+	"errors"
 	"fmt"
 	"log"
 	"net"
 	"net/netip"
 	"reflect"
+	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,23 +21,24 @@ import (
 	"kaze/internal/tunnel"
 )
 
-const connectTimeout = 10 * time.Second
-
 // inbound 管理入口节点上的全部转发规则。
 type inbound struct {
 	a *Agent
 
-	mu      sync.Mutex
-	rules   map[int64]*ruleRunner
-	users   map[int64]*userEntry
-	tunnels map[int64]*tunnelEntry
-	errs    map[int64]string
-	orphan  map[int64][2]int64 // 已停止规则尚未上报的流量
-	last    *proto.InboundConfig
+	mu     sync.Mutex
+	rules  map[int64]*ruleRunner
+	users  map[int64]*userEntry
+	errs   map[int64]string
+	orphan map[int64][2]int64 // 已停止规则尚未上报的流量
+	last   *proto.InboundConfig
+	rev    *tunnel.ReverseListener // 反向隧道监听(启动参数指定了 -rev-port 且面板下发了证书时才有)
+	revErr string
 
-	policy atomic.Pointer[relay.SniffPolicy]
-	dialer atomic.Pointer[relay.Dialer]
-	tunMap atomic.Pointer[map[int64]*tunnel.Client]
+	tunnels        *tunnelSet
+	policy         atomic.Pointer[relay.SniffPolicy]
+	dialer         atomic.Pointer[relay.Dialer]
+	sni            atomic.Pointer[sniTable] // TLS 母规则的端口 -> SNI -> 子规则
+	rejectEmptySNI atomic.Bool
 }
 
 type userEntry struct {
@@ -41,9 +46,13 @@ type userEntry struct {
 	lim  *relay.Limits
 }
 
-type tunnelEntry struct {
-	spec proto.TunnelSpec
-	cli  *tunnel.Client
+// sniTable 是 SNI 分流表。每次应用配置后整体重建,握手时无锁读取。
+type sniTable map[int]map[string]*sniTarget
+
+// sniTarget 是一次 TLS 入站握手的归属:哪条规则处理、用哪份服务端配置(证书与 ALPN)。
+type sniTarget struct {
+	r   *ruleRunner
+	cfg *tls.Config
 }
 
 func newInbound(a *Agent) *inbound {
@@ -51,13 +60,12 @@ func newInbound(a *Agent) *inbound {
 		a:       a,
 		rules:   make(map[int64]*ruleRunner),
 		users:   make(map[int64]*userEntry),
-		tunnels: make(map[int64]*tunnelEntry),
 		errs:    make(map[int64]string),
 		orphan:  make(map[int64][2]int64),
+		tunnels: newTunnelSet("入口"),
 	}
 	in.dialer.Store(relay.NewDialer(false))
-	empty := map[int64]*tunnel.Client{}
-	in.tunMap.Store(&empty)
+	in.sni.Store(&sniTable{})
 	return in
 }
 
@@ -71,35 +79,11 @@ func (in *inbound) apply(cfg *proto.InboundConfig) {
 func (in *inbound) applyLocked(cfg *proto.InboundConfig) {
 	in.last = cfg
 
-	// 1. 隧道客户端
-	for gid, spec := range cfg.Tunnels {
-		if old := in.tunnels[gid]; old != nil {
-			if reflect.DeepEqual(old.spec, *spec) {
-				continue
-			}
-			old.cli.Retire()
-			delete(in.tunnels, gid)
-		}
-		cli, err := tunnel.NewClient(spec, tunnel.ClientOpts{
-			MaxFail: cfg.MaxFail, FailTimeout: time.Duration(cfg.FailTimeout) * time.Second, Now: in.a.now,
-		})
-		if err != nil {
-			log.Printf("[入口] 出口组 #%d 隧道配置无效: %v", gid, err)
-			continue
-		}
-		in.tunnels[gid] = &tunnelEntry{spec: *spec, cli: cli}
-	}
-	for gid, old := range in.tunnels {
-		if _, ok := cfg.Tunnels[gid]; !ok {
-			old.cli.Retire()
-			delete(in.tunnels, gid)
-		}
-	}
-	tm := make(map[int64]*tunnel.Client, len(in.tunnels))
-	for gid, e := range in.tunnels {
-		tm[gid] = e.cli
-	}
-	in.tunMap.Store(&tm)
+	// 1. 反向隧道监听,以及到各出口组的隧道客户端
+	in.applyReverseLocked(cfg.Reverse)
+	in.tunnels.apply(cfg.Tunnels, tunnel.ClientOpts{
+		MaxFail: cfg.MaxFail, FailTimeout: time.Duration(cfg.FailTimeout) * time.Second, Now: in.a.now, Reverse: in.rev,
+	})
 
 	// 2. 用户级限制(限制不变则沿用同一个对象,规则无需重启)
 	for uid, ul := range cfg.Users {
@@ -115,6 +99,7 @@ func (in *inbound) applyLocked(cfg *proto.InboundConfig) {
 
 	// 3. 全局策略
 	in.policy.Store(relay.NewSniffPolicy(cfg.BlockedProtocols, cfg.BlockedHosts, cfg.AllowedHosts))
+	in.rejectEmptySNI.Store(cfg.TLSRejectEmptySNI)
 	if d := in.dialer.Load(); d.AllowPrivate != cfg.AllowPrivate {
 		in.dialer.Store(relay.NewDialer(cfg.AllowPrivate))
 	}
@@ -123,7 +108,9 @@ func (in *inbound) applyLocked(cfg *proto.InboundConfig) {
 	want := make(map[int64]*proto.Rule, len(cfg.Rules))
 	for i := range cfg.Rules {
 		r := &cfg.Rules[i]
-		if cfg.DisableUDP {
+		if r.TLS != nil {
+			r.Proto = "tcp" // TLS 入站只有 TCP
+		} else if cfg.DisableUDP {
 			if r.Proto == "udp" {
 				continue
 			}
@@ -165,6 +152,87 @@ func (in *inbound) applyLocked(cfg *proto.InboundConfig) {
 		delete(in.errs, id)
 		in.rules[id] = run
 	}
+
+	// 5. SNI 分流表
+	in.rebuildSNILocked()
+}
+
+// applyReverseLocked 按配置开启、更新或关闭反向隧道监听。
+func (in *inbound) applyReverseLocked(rc *proto.ReverseListen) {
+	port := in.a.opt.RevPort
+	if rc == nil || port == 0 {
+		if in.rev != nil {
+			in.rev.Close()
+			in.rev = nil
+			log.Printf("[入口] 反向隧道监听已关闭")
+		}
+		in.revErr = ""
+		return
+	}
+	cert, err := tunnel.ParseCert(rc.CertPEM, rc.KeyPEM)
+	if err != nil {
+		in.revErr = "反向隧道证书无效: " + err.Error()
+		log.Printf("[入口] %s", in.revErr)
+		return
+	}
+	if in.rev == nil {
+		ln, err := tunnel.NewReverseListener(in.a.opt.Bind, port, in.a.now)
+		if err != nil {
+			in.revErr = fmt.Sprintf("反向隧道端口 %d 监听失败: %v", port, err)
+			log.Printf("[入口] %s", in.revErr)
+			return
+		}
+		in.rev = ln
+		log.Printf("[入口] 反向隧道已监听 :%d", ln.Port())
+	}
+	groups := make(map[int64]*tunnel.Keys, len(rc.Groups))
+	for gid, key := range rc.Groups {
+		if k, err := tunnel.DeriveKeys(key); err == nil {
+			groups[gid] = k
+		}
+	}
+	in.rev.Update(&cert, groups)
+	in.revErr = ""
+}
+
+// rebuildSNILocked 重建"母规则端口 -> SNI -> 子规则"的分流表。
+func (in *inbound) rebuildSNILocked() {
+	parents := map[int]*ruleRunner{}
+	var children []*ruleRunner
+	for _, run := range in.rules {
+		switch run.tlsMode() {
+		case proto.TLSModeParent:
+			parents[run.spec.ListenPort] = run
+		case proto.TLSModeChild:
+			children = append(children, run)
+		}
+	}
+	// 同一个 SNI 被多条子规则声明时(面板会阻止),规则号小的生效
+	sort.Slice(children, func(i, j int) bool { return children[i].spec.ID < children[j].spec.ID })
+	tbl := sniTable{}
+	for _, ch := range children {
+		p := parents[ch.spec.ListenPort]
+		if p == nil {
+			continue // 母规则不存在或未启动:子规则暂时无法接入
+		}
+		// 证书的选择顺序:子规则自带的 > 母规则配置的 > 为子规则自动生成的自签名证书
+		cert := ch.cert
+		if !ch.ownCert && p.ownCert {
+			cert = p.cert
+		}
+		t := &sniTarget{r: ch, cfg: serverTLSConfig(cert, ch.spec.TLS.ALPN)}
+		m := tbl[ch.spec.ListenPort]
+		if m == nil {
+			m = map[string]*sniTarget{}
+			tbl[ch.spec.ListenPort] = m
+		}
+		for _, name := range ch.spec.TLS.SNI {
+			if name = strings.ToLower(name); m[name] == nil {
+				m[name] = t
+			}
+		}
+	}
+	in.sni.Store(&tbl)
 }
 
 func (in *inbound) stopLocked(id int64, run *ruleRunner) {
@@ -178,11 +246,11 @@ func (in *inbound) stopLocked(id int64, run *ruleRunner) {
 	delete(in.rules, id)
 }
 
-// retryFailed 重新尝试启动失败的规则(例如端口被占用后又释放)。
+// retryFailed 重新尝试启动失败的规则(例如端口被占用后又释放),以及没能监听成功的反向隧道端口。
 func (in *inbound) retryFailed() bool {
 	in.mu.Lock()
 	defer in.mu.Unlock()
-	if len(in.errs) == 0 || in.last == nil {
+	if (len(in.errs) == 0 && in.revErr == "") || in.last == nil {
 		return false
 	}
 	in.applyLocked(in.last)
@@ -214,17 +282,30 @@ func (in *inbound) collectIf(take func(proto.Traffic) bool) {
 	}
 }
 
+// ruleErrors 返回启动失败的规则;键 0 是节点级的错误(反向隧道监听失败)。
 func (in *inbound) ruleErrors() map[int64]string {
 	in.mu.Lock()
 	defer in.mu.Unlock()
-	out := make(map[int64]string, len(in.errs))
+	out := make(map[int64]string, len(in.errs)+1)
 	for k, v := range in.errs {
 		out[k] = v
+	}
+	if in.revErr != "" {
+		out[0] = in.revErr
 	}
 	return out
 }
 
-func (in *inbound) tunnel(gid int64) *tunnel.Client { return (*in.tunMap.Load())[gid] }
+// reverseStatus 返回允许拨入的出口组数,以及其中已有连接的组数。
+func (in *inbound) reverseStatus() (total, up int) {
+	in.mu.Lock()
+	ln := in.rev
+	in.mu.Unlock()
+	if ln == nil {
+		return 0, 0
+	}
+	return ln.Stats()
+}
 
 func (in *inbound) stopAll() {
 	in.mu.Lock()
@@ -234,13 +315,16 @@ func (in *inbound) stopAll() {
 	for id, run := range in.rules {
 		in.stopLocked(id, run)
 	}
-	for gid, e := range in.tunnels {
-		e.cli.Close()
-		delete(in.tunnels, gid)
+	in.sni.Store(&sniTable{})
+	in.tunnels.closeAll()
+	if in.rev != nil {
+		in.rev.Close()
+		in.rev = nil
 	}
+	in.revErr = ""
 }
 
-// diag 测量本节点到规则下一跳(出口节点或目标)的 TCP 建连耗时。
+// diag 测量本节点到规则下一跳(出口节点或目标)的连通性。
 func (in *inbound) diag(ruleID int64) []proto.DiagHop {
 	in.mu.Lock()
 	run := in.rules[ruleID]
@@ -253,42 +337,13 @@ func (in *inbound) diag(ruleID int64) []proto.DiagHop {
 		}
 		return []proto.DiagHop{{From: from, To: "-", Error: errMsg}}
 	}
-	if run.spec.OutGroup == 0 {
+	switch {
+	case run.tlsMode() == proto.TLSModeParent:
+		return []proto.DiagHop{{From: from, To: fmt.Sprintf("TLS 端口 %d(母规则只负责监听与分流)", run.spec.ListenPort)}}
+	case run.spec.OutGroup == 0:
 		return tcping(from, "目标 ", run.spec.Targets, in.dialer.Load())
 	}
-	cli := in.tunnel(run.spec.OutGroup)
-	if cli == nil {
-		return []proto.DiagHop{{From: from, To: "-", Error: "出口组不可用"}}
-	}
-	return tcping(from, "出口 ", cli.Endpoints(), relay.NewDialer(true))
-}
-
-func tcping(from, toPrefix string, addrs []string, d *relay.Dialer) []proto.DiagHop {
-	hops := make([]proto.DiagHop, len(addrs))
-	var wg sync.WaitGroup
-	for i, addr := range addrs {
-		wg.Add(1)
-		go func(i int, addr string) {
-			defer wg.Done()
-			h := proto.DiagHop{From: from, To: toPrefix + addr}
-			ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
-			defer cancel()
-			if host, _, err := net.SplitHostPort(addr); err == nil {
-				relay.Resolve(ctx, host) // 预解析,不把 DNS 耗时算进建连时间
-			}
-			t0 := time.Now()
-			c, err := d.DialTCP(ctx, addr)
-			if err != nil {
-				h.Error = err.Error()
-			} else {
-				h.Ms = float64(time.Since(t0).Microseconds()) / 1000
-				c.Close()
-			}
-			hops[i] = h
-		}(i, addr)
-	}
-	wg.Wait()
-	return hops
+	return tunnelHops(from, in.tunnels.get(run.spec.OutGroup))
 }
 
 // ---- 单条规则 ----
@@ -302,9 +357,21 @@ type ruleRunner struct {
 
 	up, down atomic.Int64
 
+	// TLS 入站
+	cert    *tls.Certificate // 规则配置的证书,或启动时自动生成的自签名证书
+	ownCert bool             // 证书来自规则配置
+	self    *sniTarget       // 独占端口时:握手归属就是自己
+
 	tcpLn net.Listener
 	udp   *relay.UDPRelay
 	live  *ruleConns
+}
+
+func (r *ruleRunner) tlsMode() string {
+	if r.spec.TLS == nil {
+		return ""
+	}
+	return r.spec.TLS.Mode
 }
 
 func bucketUp(l *relay.Limits) *relay.Bucket {
@@ -321,17 +388,69 @@ func bucketDown(l *relay.Limits) *relay.Bucket {
 	return l.Down
 }
 
+func serverTLSConfig(cert *tls.Certificate, alpn []string) *tls.Config {
+	return &tls.Config{Certificates: []tls.Certificate{*cert}, MinVersion: tls.VersionTLS12, NextProtos: alpn}
+}
+
+// loadTLS 准备规则的 TLS 入站证书:优先用规则配置的,否则生成一张自签名证书(客户端需要关闭证书校验)。
+func (r *ruleRunner) loadTLS() error {
+	t := r.spec.TLS
+	if t.CertPEM != "" || t.KeyPEM != "" {
+		cert, err := tunnel.ParseCert(t.CertPEM, t.KeyPEM)
+		if err != nil {
+			return fmt.Errorf("TLS 入站证书无效: %w", err)
+		}
+		r.cert, r.ownCert = &cert, true
+		return nil
+	}
+	names := t.SNI
+	if len(names) == 0 {
+		names = []string{"localhost"}
+	}
+	cp, kp, _, err := tunnel.GenerateCert(names...)
+	if err != nil {
+		return err
+	}
+	cert, err := tunnel.ParseCert(cp, kp)
+	if err != nil {
+		return err
+	}
+	r.cert = &cert
+	return nil
+}
+
 func (in *inbound) startRule(spec proto.Rule, ulim *relay.Limits, cfg *proto.InboundConfig) (*ruleRunner, error) {
 	r := &ruleRunner{
-		in: in, spec: spec, ulim: ulim,
+		in: in, spec: spec, ulim: ulim, live: newRuleConns(),
 		rlim: relay.NewLimits(spec.SpeedLimit, spec.ConnLimit, spec.IPLimit),
 	}
-	if spec.OutGroup == 0 {
+	mode := r.tlsMode()
+	switch mode {
+	case "", proto.TLSModeAlone, proto.TLSModeParent, proto.TLSModeChild:
+	default:
+		return nil, fmt.Errorf("未知的 TLS 入站模式: %s", mode)
+	}
+	if mode != "" {
+		if err := r.loadTLS(); err != nil {
+			return nil, err
+		}
+	}
+	if mode != proto.TLSModeParent && spec.OutGroup == 0 {
 		if len(spec.Targets) == 0 {
-			return nil, fmt.Errorf("没有转发目标")
+			return nil, errors.New("没有转发目标")
 		}
 		r.bal = relay.NewBalancer(spec.Targets, spec.LB, cfg.MaxFail, time.Duration(cfg.FailTimeout)*time.Second)
 	}
+	if mode == proto.TLSModeChild {
+		if len(spec.TLS.SNI) == 0 {
+			return nil, errors.New("子规则没有配置 SNI")
+		}
+		return r, nil // 子规则不监听端口:连接由同端口的母规则握手后交过来
+	}
+	if mode != "" {
+		r.self = &sniTarget{r: r, cfg: serverTLSConfig(r.cert, spec.TLS.ALPN)}
+	}
+
 	addr := net.JoinHostPort(in.a.opt.Bind, fmt.Sprint(spec.ListenPort))
 	if strings.Contains(spec.Proto, "tcp") {
 		ln, err := net.Listen("tcp", addr)
@@ -361,7 +480,6 @@ func (in *inbound) startRule(spec proto.Rule, ulim *relay.Limits, cfg *proto.Inb
 			Open:       r.openUDP,
 		}
 	}
-	r.live = newRuleConns()
 	if r.udp != nil {
 		go r.udp.Serve()
 	}
@@ -391,20 +509,88 @@ func (r *ruleRunner) serveTCP() {
 			time.Sleep(20 * time.Millisecond) // 文件描述符耗尽等瞬时错误
 			continue
 		}
-		go r.handle(c)
+		if r.self != nil {
+			go r.handleTLS(c)
+		} else {
+			go r.serve(c, addrPortOf(c.RemoteAddr()), true, "")
+		}
 	}
 }
 
-func addrPortOf(a net.Addr) netip.AddrPort {
-	if t, ok := a.(*net.TCPAddr); ok {
-		ap := t.AddrPort()
-		return netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port())
+var (
+	errSNIEmpty   = errors.New("TLS 入站: 客户端没有发送 SNI")
+	errSNIDenied  = errors.New("TLS 入站: SNI 不在允许范围内")
+	errSNIUnknown = errors.New("TLS 入站: 没有规则匹配这个 SNI")
+	errTLSBlocked = errors.New("TLS 入站: 入口组屏蔽了 TLS 协议")
+)
+
+// route 决定一次 TLS 入站握手由哪条规则处理。握手过程中和握手完成后各调用一次。
+func (r *ruleRunner) route(sni string) (*sniTarget, error) {
+	in := r.in
+	if sni == "" && in.rejectEmptySNI.Load() {
+		return nil, errSNIEmpty
 	}
-	return netip.AddrPort{}
+	// 入口组的协议屏蔽与域名黑白名单同样约束 TLS 入站
+	if pol := in.policy.Load(); pol != nil {
+		if pol.BlockTLS {
+			return nil, errTLSBlocked
+		}
+		if !pol.HostAllowed(sni) {
+			return nil, errSNIDenied
+		}
+	}
+	if r.tlsMode() == proto.TLSModeParent {
+		if t := (*in.sni.Load())[r.spec.ListenPort][sni]; t != nil {
+			return t, nil
+		}
+		return nil, errSNIUnknown
+	}
+	if names := r.spec.TLS.SNI; len(names) > 0 && !slices.ContainsFunc(names, func(n string) bool { return strings.EqualFold(n, sni) }) {
+		return nil, errSNIDenied
+	}
+	return r.self, nil
 }
 
-func (r *ruleRunner) handle(c net.Conn) {
+// handleTLS 在监听端口上终结 TLS,然后把内层的明文连接交给握手归属的规则。
+func (r *ruleRunner) handleTLS(c net.Conn) {
 	src := addrPortOf(c.RemoteAddr())
+	if !r.live.track(c) { // 握手期间的连接记在监听它的规则名下
+		c.Close()
+		return
+	}
+	defer r.live.forget(c)
+	var selected *ruleRunner
+	tc := tls.Server(c, &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		GetConfigForClient: func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
+			t, err := r.route(strings.ToLower(chi.ServerName))
+			if err != nil {
+				return nil, err
+			}
+			selected = t.r
+			return t.cfg, nil
+		},
+	})
+	ctx, cancel := context.WithTimeout(r.live.ctx, tlsHandshakeTimeout)
+	err := tc.HandshakeContext(ctx)
+	cancel()
+	if err != nil {
+		c.Close()
+		return
+	}
+	cs := tc.ConnectionState()
+	t, err := r.route(strings.ToLower(cs.ServerName))
+	// 规则要求了 ALPN 时,没有声明 ALPN 的客户端也不接受(声明了但没有交集的在握手阶段就失败了)
+	if err != nil || t.r != selected || (len(t.r.spec.TLS.ALPN) > 0 && cs.NegotiatedProtocol == "") {
+		tc.Close()
+		return
+	}
+	t.r.serve(tc, src, false, cs.NegotiatedProtocol)
+}
+
+// serve 转发一条客户端连接。c 是原始 TCP 连接,或入口终结 TLS 之后的明文连接。
+// sniff 表示需要按入口组的入站策略检查首包;alpn 是 TLS 入站时协商出的应用层协议。
+func (r *ruleRunner) serve(c net.Conn, src netip.AddrPort, sniff bool, alpn string) {
 	if !relay.AcquireAll(src.Addr(), r.rlim, r.ulim) {
 		c.Close()
 		return
@@ -417,11 +603,13 @@ func (r *ruleRunner) handle(c net.Conn) {
 	defer r.live.forget(c)
 
 	var prefix []byte
-	if pol := r.in.policy.Load(); pol != nil {
-		var ok bool
-		if prefix, ok = pol.Check(c); !ok {
-			c.Close()
-			return
+	if sniff {
+		if pol := r.in.policy.Load(); pol != nil {
+			var ok bool
+			if prefix, ok = pol.Check(c); !ok {
+				c.Close()
+				return
+			}
 		}
 	}
 
@@ -431,18 +619,24 @@ func (r *ruleRunner) handle(c net.Conn) {
 	var err error
 	if r.spec.OutGroup == 0 {
 		var be *relay.Backend
-		target, be, err = relay.DialBalanced(ctx, r.in.dialer.Load(), r.bal, relay.HashAddr(src.Addr()))
+		var pp []byte
+		target, be, pp, err = connectTarget(ctx, r.in.dialer.Load(), r.bal, relay.HashAddr(src.Addr()), targetOpts{
+			proxyProtocol: r.spec.ProxyProtocol, src: src, dst: addrPortOf(c.LocalAddr()),
+			origin: r.spec.OriginTLS, alpn: alpn,
+		})
 		if err == nil {
 			done = func() { be.Active.Add(-1) }
-			if r.spec.ProxyProtocol > 0 {
-				pp := relay.ProxyHeader(r.spec.ProxyProtocol, src, addrPortOf(c.LocalAddr()))
-				prefix = append(pp, prefix...)
-			}
+			prefix = append(pp, prefix...)
 		}
-	} else if cli := r.in.tunnel(r.spec.OutGroup); cli != nil {
-		target, done, err = cli.Open(ctx, tunnel.StreamHeader{Cmd: tunnel.CmdTCP, RuleID: uint32(r.spec.ID), Src: src})
+	} else if cli := r.in.tunnels.get(r.spec.OutGroup); cli != nil {
+		h := tunnel.StreamHeader{Cmd: tunnel.CmdTCP, RuleID: uint32(r.spec.ID), Src: src}
+		if r.spec.OriginTLS != nil {
+			// 只有最后一跳要做回源 TLS 时才需要 ALPN。其余情况保持 1.0 的流头格式,还没升级的出口也能照常处理。
+			h.ALPN = alpn
+		}
+		target, done, err = cli.Open(ctx, h)
 	} else {
-		err = fmt.Errorf("出口组不可用")
+		err = errors.New("出口组不可用")
 	}
 	cancel()
 	if err != nil {
@@ -473,9 +667,9 @@ func (r *ruleRunner) openUDP(client netip.AddrPort, _ uint32) (relay.Upstream, e
 		}
 		return relay.UDPConnUpstream{UDPConn: uc}, nil
 	}
-	cli := r.in.tunnel(r.spec.OutGroup)
+	cli := r.in.tunnels.get(r.spec.OutGroup)
 	if cli == nil {
-		return nil, fmt.Errorf("出口组不可用")
+		return nil, errors.New("出口组不可用")
 	}
-	return cli.OpenUDP(ctx, uint32(r.spec.ID), client)
+	return cli.OpenUDP(ctx, uint32(r.spec.ID), client, r.spec.UDPStream)
 }

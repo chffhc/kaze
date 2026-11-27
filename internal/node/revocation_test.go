@@ -62,7 +62,7 @@ func TestActiveRuleRevocation(t *testing.T) {
 				oc.Rules = append(oc.Rules, proto.OutRule{ID: i, Targets: []string{target}})
 			}
 			if tc.tunnelled {
-				if err := exit.out.apply(&oc); err != nil {
+				if err := exit.out.apply(&oc, 1); err != nil {
 					t.Fatal(err)
 				}
 				spec := &proto.TunnelSpec{GroupID: 1, Transport: oc.Transport, Key: oc.Key, Endpoints: []string{fmt.Sprintf("127.0.0.1:%d", exit.out.listenPort())}, Mux: true, MuxConns: 1, UDPOverTCP: tc.streamUDP}
@@ -90,7 +90,7 @@ func TestActiveRuleRevocation(t *testing.T) {
 			}
 			if tc.exit {
 				oc.Rules = oc.Rules[1:]
-				if err := exit.out.apply(&oc); err != nil {
+				if err := exit.out.apply(&oc, 1); err != nil {
 					t.Fatal(err)
 				}
 			} else {

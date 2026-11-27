@@ -135,3 +135,22 @@ func TestTrafficLegacyAndMissingRule(t *testing.T) {
 		t.Fatal(sum, e)
 	}
 }
+
+func TestChainTrafficReplay(t *testing.T) {
+	h, _ := trafficDB(t)
+	db := h.s.db
+	if _, err := db.Exec(`INSERT INTO device_groups(id,name,type,token,ratio,config,created_at) VALUES(3,'hop','out','c',9,'{}',0),(4,'chain','chain','d',3,'{"chain_hops":[2,3]}',0); UPDATE rules SET out_group=4`); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := h.ingest(1, "node", fixtureReport(1)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if billed := scalar[int](t, db, `SELECT traffic_used FROM users`); billed != 72 {
+		t.Fatalf("billed %d, want 72", billed)
+	}
+	if n := scalar[int](t, db, `SELECT COUNT(*) FROM device_groups WHERE traffic=18`); n != 4 {
+		t.Fatalf("%d groups counted once, want 4", n)
+	}
+}
