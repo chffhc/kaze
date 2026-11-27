@@ -4,10 +4,13 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -34,14 +37,27 @@ func freePort(t *testing.T) int {
 
 // echoServer 同时提供 TCP 与 UDP 回显。
 func echoServer(t *testing.T) string {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	port := ln.Addr().(*net.TCPAddr).Port
-	uc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port})
-	if err != nil {
-		t.Fatal(err)
+	return echoServerWithUDPPeer(t, nil)
+}
+
+func echoServerWithUDPPeer(t *testing.T, peers chan<- netip.AddrPort) string {
+	var ln net.Listener
+	var uc *net.UDPConn
+	for attempt := 0; ; attempt++ {
+		var err error
+		ln, err = net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		// A free ephemeral TCP port can already be in use for UDP.
+		uc, err = net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: ln.Addr().(*net.TCPAddr).Port})
+		if err == nil {
+			break
+		}
+		ln.Close()
+		if !errors.Is(err, syscall.EADDRINUSE) || attempt >= 9 {
+			t.Fatal(err)
+		}
 	}
 	t.Cleanup(func() { ln.Close(); uc.Close() })
 	go func() {
@@ -60,10 +76,13 @@ func echoServer(t *testing.T) string {
 			if err != nil {
 				return
 			}
+			if peers != nil {
+				peers <- from
+			}
 			uc.WriteToUDPAddrPort(buf[:n], from)
 		}
 	}()
-	return fmt.Sprintf("127.0.0.1:%d", port)
+	return ln.Addr().String()
 }
 
 func tcpEcho(t *testing.T, addr string, size int) {

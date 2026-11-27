@@ -638,6 +638,11 @@ func TestTLSInboundSNISplit(t *testing.T) {
 	}
 
 	// 热更新:删掉子规则 12 不影响子规则 11 上已有的连接
+	renewedCert, renewedKey, _, renewedPool := testCert(t, "*.cdn.example.com")
+	renewedTLS := *parent.TLS
+	renewedTLS.CertPEM, renewedTLS.KeyPEM = renewedCert, renewedKey
+	parent.TLS = &renewedTLS
+	wildPool = renewedPool
 	cfg.Rules = []proto.Rule{parent, c1, c3}
 	apply()
 	hold.Write([]byte("still-here\n"))
@@ -667,11 +672,26 @@ func TestTLSInboundSNISplit(t *testing.T) {
 
 	// 母规则被删除:端口停止监听,子规则留在配置里但无法接入
 	cfg.BlockedProtocols = nil
+	apply()
+	active, err := tlsClient(addr, "three.other.com", nil, ownPool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer active.Close()
+	if _, err := banner(active); err != nil {
+		t.Fatal(err)
+	}
 	cfg.Rules = []proto.Rule{c1, c3}
 	apply()
 	if c, err := net.DialTimeout("tcp", addr, time.Second); err == nil {
 		c.Close()
 		t.Fatal("母规则删除后端口应停止监听")
+	}
+	active.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := active.Read(make([]byte, 1)); err == nil {
+		t.Fatal("母规则撤销后子规则连接仍可用")
+	} else if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		t.Fatal("母规则撤销后子规则连接未关闭")
 	}
 	// 母规则回来:子规则立即恢复
 	cfg.Rules = []proto.Rule{parent, c1, c3}

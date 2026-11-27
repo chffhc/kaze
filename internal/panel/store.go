@@ -20,7 +20,48 @@ import (
 //
 //	0 / 1  1.0.x:rules 表带 UNIQUE(in_group, listen_port)
 //	2      1.1.0:rules 增加 TLS 入站字段,端口唯一性改为"子规则除外"的部分唯一索引;nodes 增加 rev_port
-const schemaVersion = 2
+//	3      增加流量上报游标和未归属流量表
+//	4      保留删除和移组规则的计费归属
+const schemaVersion = 4
+
+const ruleBillingDDL = `
+CREATE TABLE IF NOT EXISTS rule_billing_history (
+  rule_id INTEGER NOT NULL, in_group INTEGER NOT NULL, user_id INTEGER NOT NULL,
+  out_group INTEGER NOT NULL, ratio REAL NOT NULL, hops TEXT NOT NULL,
+  PRIMARY KEY(rule_id,in_group)
+) WITHOUT ROWID;
+CREATE TRIGGER IF NOT EXISTS rule_billing_before_move
+BEFORE UPDATE OF in_group ON rules WHEN OLD.in_group <> NEW.in_group
+BEGIN
+  INSERT OR REPLACE INTO rule_billing_history
+  SELECT OLD.id, OLD.in_group, OLD.user_id, OLD.out_group,
+    COALESCE((SELECT SUM(ratio) FROM device_groups WHERE id=OLD.in_group OR id=OLD.out_group),1),
+    COALESCE((SELECT json_extract(config,'$.chain_hops') FROM device_groups
+      WHERE id=OLD.out_group AND type='chain' AND json_valid(config)),'[]');
+END;
+CREATE TRIGGER IF NOT EXISTS rule_billing_before_delete
+BEFORE DELETE ON rules
+BEGIN
+  INSERT OR REPLACE INTO rule_billing_history
+  SELECT OLD.id, OLD.in_group, OLD.user_id, OLD.out_group,
+    COALESCE((SELECT SUM(ratio) FROM device_groups WHERE id=OLD.in_group OR id=OLD.out_group),1),
+    COALESCE((SELECT json_extract(config,'$.chain_hops') FROM device_groups
+      WHERE id=OLD.out_group AND type='chain' AND json_valid(config)),'[]');
+END;
+`
+
+const trafficDDL = `
+-- One durable cursor per ingress node / reporting stream, independent of node retention.
+CREATE TABLE IF NOT EXISTS traffic_unattributed (
+ group_id INTEGER NOT NULL, uid TEXT NOT NULL, stream TEXT NOT NULL,
+ seq INTEGER NOT NULL, rule_id INTEGER NOT NULL, up INTEGER NOT NULL, down INTEGER NOT NULL, hour INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS traffic_cursors (
+ group_id INTEGER NOT NULL, uid TEXT NOT NULL, stream TEXT NOT NULL,
+ seq INTEGER NOT NULL, digest BLOB NOT NULL,
+ PRIMARY KEY(group_id,uid,stream)
+) WITHOUT ROWID;
+`
 
 const schemaBase = `
 CREATE TABLE IF NOT EXISTS users (
@@ -56,6 +97,7 @@ CREATE TABLE IF NOT EXISTS device_groups (
   traffic    INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL
 );
+` + trafficDDL + `
 CREATE TABLE IF NOT EXISTS nodes (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
   group_id     INTEGER NOT NULL,
@@ -171,7 +213,7 @@ func openDB(dir string) (*sql.DB, error) {
 		return nil, err
 	}
 	dsn := "file:" + filepath.ToSlash(filepath.Join(dir, "kaze.db")) +
-		"?_pragma=busy_timeout(8000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_txlock=immediate"
+		"?_pragma=busy_timeout(8000)&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)&_txlock=immediate"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
@@ -204,25 +246,42 @@ func migrate(db *sql.DB, dir string) error {
 			return err
 		}
 		defer tx.Rollback()
-		if _, err := tx.Exec(schemaBase + rulesDDL("rules") + rulesIndexes + fmt.Sprintf("PRAGMA user_version = %d;", schemaVersion)); err != nil {
+		if _, err := tx.Exec(schemaBase + rulesDDL("rules") + rulesIndexes + ruleBillingDDL + fmt.Sprintf("PRAGMA user_version = %d;", schemaVersion)); err != nil {
 			return fmt.Errorf("初始化数据库失败: %w", err)
 		}
 		return tx.Commit()
 	}
 
-	// 1.0.x -> 1.1.0
-	backup := filepath.Join(dir, "kaze.db.v1.bak")
+	backup := filepath.Join(dir, fmt.Sprintf("kaze.db.v%d.bak", max(ver, 1)))
 	if _, err := os.Stat(backup); os.IsNotExist(err) {
 		// VACUUM INTO 得到一份一致的快照(直接拷贝文件会漏掉 WAL 里尚未合并的内容)
 		if _, err := db.Exec(`VACUUM INTO ?`, backup); err != nil {
 			return fmt.Errorf("升级前备份数据库失败: %w", err)
 		}
 	}
-	if err := migrateV2(db); err != nil {
+	var err error
+	if ver >= 2 {
+		err = migrateLedger(db)
+	} else {
+		err = migrateV2(db)
+	}
+	if err != nil {
 		return fmt.Errorf("升级数据库结构失败(数据未改动,备份在 %s): %w", backup, err)
 	}
 	log.Printf("数据库结构已升级到版本 %d,升级前的备份保存在 %s", schemaVersion, backup)
 	return nil
+}
+
+func migrateLedger(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(trafficDDL + ruleBillingDDL + fmt.Sprintf("PRAGMA user_version = %d", schemaVersion)); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // migrateV2 重建 rules 表(SQLite 不能直接去掉表级的 UNIQUE 约束)并给 nodes 加列,整个过程在一个事务里。
@@ -242,7 +301,7 @@ func migrateV2(db *sql.DB) error {
 	if _, err := tx.Exec(schemaBase + `DROP TABLE IF EXISTS rules_v2;` + rulesDDL("rules_v2") +
 		`INSERT INTO rules_v2(` + rulesV1Cols + `) SELECT ` + rulesV1Cols + ` FROM rules;
 		DROP TABLE rules;
-		ALTER TABLE rules_v2 RENAME TO rules;` + rulesIndexes); err != nil {
+		ALTER TABLE rules_v2 RENAME TO rules;` + rulesIndexes + ruleBillingDDL); err != nil {
 		return err
 	}
 	var after int
@@ -311,14 +370,17 @@ func (u *User) Active() bool {
 	if u.Banned {
 		return false
 	}
+	if u.IsAdmin() {
+		return true
+	}
 	if u.ExpireAt != 0 && u.ExpireAt <= now() {
 		return false
 	}
-	return u.IsAdmin() || u.TrafficUsed < u.TrafficQuota
+	return u.TrafficUsed < u.TrafficQuota
 }
 
 // activeUserSQL 与 User.Active 等价的 SQL 条件(u 为 users 表别名,参数为当前时间)。
-const activeUserSQL = `u.banned=0 AND (u.expire_at=0 OR u.expire_at>?) AND (u.role='admin' OR u.traffic_used<u.traffic_quota)`
+const activeUserSQL = `u.banned=0 AND (u.role='admin' OR ((u.expire_at=0 OR u.expire_at>?) AND u.traffic_used<u.traffic_quota))`
 
 const userCols = `u.id,u.username,u.password,u.role,u.balance,u.plan_id,u.traffic_quota,u.traffic_used,u.expire_at,
 u.max_rules,u.speed_limit,u.conn_limit,u.ip_limit,u.auto_renew,u.banned,u.note,u.token_ver,u.created_at,

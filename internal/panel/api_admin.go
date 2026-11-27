@@ -24,6 +24,13 @@ func (s *Server) handleAdminStats(w http.ResponseWriter, r *http.Request, u *Use
 	s.db.QueryRow(`SELECT COUNT(*) FROM rules`).Scan(&rules)
 	s.db.QueryRow(`SELECT COUNT(*) FROM nodes`).Scan(&nodes)
 	s.db.QueryRow(`SELECT COUNT(*) FROM device_groups`).Scan(&groups)
+	var unattributed int64
+	var unattributedBytes float64
+	if err := s.db.QueryRow(`SELECT COUNT(*), TOTAL(MAX(up,0)) + TOTAL(MAX(down,0))
+		FROM traffic_unattributed`).Scan(&unattributed, &unattributedBytes); err != nil {
+		s.dbErr(w, err)
+		return
+	}
 	online := 0
 	for _, n := range s.hub.onlineCount() {
 		online += n
@@ -62,6 +69,7 @@ func (s *Server) handleAdminStats(w http.ResponseWriter, r *http.Request, u *Use
 	s.ok(w, H{
 		"users": users, "rules": rules, "nodes": nodes, "nodes_online": online, "groups": groups,
 		"hourly": hourly, "daily": daily, "top_users": tops,
+		"unattributed_count": unattributed, "unattributed_bytes": unattributedBytes,
 		"recharge_today": income(day), "recharge_month": income(month),
 		"sales_today": sales(day), "sales_month": sales(month),
 		"version": proto.Version,
@@ -613,6 +621,8 @@ func keyMaterialBase(old *Group, body []byte) *Group {
 }
 
 func (s *Server) handleAdminGroupCreate(w http.ResponseWriter, r *http.Request, u *User) {
+	s.ruleMu.Lock()
+	defer s.ruleMu.Unlock()
 	var in groupInput
 	in.Ratio, in.Public = 1, true
 	in.Config.Mux = true
@@ -646,6 +656,8 @@ func (s *Server) handleAdminGroupCreate(w http.ResponseWriter, r *http.Request, 
 }
 
 func (s *Server) handleAdminGroupUpdate(w http.ResponseWriter, r *http.Request, u *User) {
+	s.ruleMu.Lock()
+	defer s.ruleMu.Unlock()
 	old, err := getGroup(s.db, pathID(r))
 	if err != nil {
 		s.dbErr(w, err)
@@ -683,6 +695,8 @@ func (s *Server) handleAdminGroupUpdate(w http.ResponseWriter, r *http.Request, 
 }
 
 func (s *Server) handleAdminGroupDelete(w http.ResponseWriter, r *http.Request, u *User) {
+	s.ruleMu.Lock()
+	defer s.ruleMu.Unlock()
 	id := pathID(r)
 	all, err := listGroups(s.db)
 	if err != nil {
@@ -696,22 +710,32 @@ func (s *Server) handleAdminGroupDelete(w http.ResponseWriter, r *http.Request, 
 		}
 	}
 	var n int
-	s.db.QueryRow(`SELECT COUNT(*) FROM rules WHERE in_group=? OR out_group=?`, id, id).Scan(&n)
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM rules WHERE in_group=? OR out_group=?`, id, id).Scan(&n); err != nil {
+		s.dbErr(w, err)
+		return
+	}
 	if n > 0 && r.URL.Query().Get("force") != "1" {
 		s.fail(w, http.StatusConflict, fmt.Sprintf("该设备组下还有 %d 条规则,确认后将一并删除", n))
 		return
 	}
-	s.ruleMu.Lock()
-	defer s.ruleMu.Unlock()
 	tx, err := s.db.Begin()
 	if err != nil {
 		s.dbErr(w, err)
 		return
 	}
 	defer tx.Rollback()
-	tx.Exec(`DELETE FROM rules WHERE in_group=? OR out_group=?`, id, id)
-	tx.Exec(`DELETE FROM nodes WHERE group_id=?`, id)
-	tx.Exec(`DELETE FROM device_groups WHERE id=?`, id)
+	if _, err := tx.Exec(`DELETE FROM rules WHERE in_group=? OR out_group=?`, id, id); err != nil {
+		s.dbErr(w, err)
+		return
+	}
+	if _, err := tx.Exec(`DELETE FROM nodes WHERE group_id=?`, id); err != nil {
+		s.dbErr(w, err)
+		return
+	}
+	if _, err := tx.Exec(`DELETE FROM device_groups WHERE id=?`, id); err != nil {
+		s.dbErr(w, err)
+		return
+	}
 	if err := tx.Commit(); err != nil {
 		s.dbErr(w, err)
 		return
@@ -817,6 +841,7 @@ func (s *Server) handleAdminPlanSave(w http.ResponseWriter, r *http.Request, u *
 		s.dbErr(w, err)
 		return
 	}
+	s.hub.Dirty()
 	s.ok(w, H{"ok": true})
 }
 
@@ -825,6 +850,7 @@ func (s *Server) handleAdminPlanDelete(w http.ResponseWriter, r *http.Request, u
 		s.dbErr(w, err)
 		return
 	}
+	s.hub.Dirty()
 	s.ok(w, H{"ok": true})
 }
 

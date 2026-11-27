@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"context"
 	"net/netip"
 	"sync"
 	"sync/atomic"
@@ -63,8 +64,15 @@ func (b *Bucket) refill(now time.Time) {
 
 // Wait 消耗 n 字节令牌,必要时阻塞。
 func (b *Bucket) Wait(n int) {
+	_ = b.wait(context.Background(), n)
+}
+
+func (b *Bucket) wait(ctx context.Context, n int) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if b == nil || n <= 0 {
-		return
+		return nil
 	}
 	b.mu.Lock()
 	b.refill(time.Now())
@@ -74,8 +82,20 @@ func (b *Bucket) Wait(n int) {
 		d = time.Duration(-b.tokens / b.rate * float64(time.Second))
 	}
 	b.mu.Unlock()
-	if d > 0 {
-		time.Sleep(d)
+	if d <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		b.mu.Lock()
+		b.refill(time.Now())
+		b.tokens = min(b.tokens+float64(n), b.burst)
+		b.mu.Unlock()
+		return ctx.Err()
 	}
 }
 

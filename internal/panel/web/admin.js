@@ -14,6 +14,7 @@ const AdminDashPage = {
       <dl class="stats" style="margin:0">
         <div class="fact"><dt>在线节点</dt><dd>{{ s.nodes_online }}<small> / {{ s.nodes }} 台</small></dd></div>
         <div class="fact"><dt>用户 / 规则</dt><dd>{{ s.users }}<small> 人 / {{ s.rules }} 条</small></dd></div>
+        <div v-if="s.unattributed_count" class="fact"><dt>近 62 天未归属流量</dt><dd>{{ fmt.bytes(s.unattributed_bytes) }}<small> / {{ s.unattributed_count }} 条</small></dd></div>
         <div class="fact"><dt>充值(今日 / 本月)</dt><dd>{{ fmt.money(s.recharge_today) }}<small> / {{ fmt.money(s.recharge_month) }}</small></dd></div>
         <div class="fact"><dt>套餐销售(今日 / 本月)</dt><dd>{{ fmt.money(s.sales_today) }}<small> / {{ fmt.money(s.sales_month) }}</small></dd></div>
       </dl>

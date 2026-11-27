@@ -435,8 +435,7 @@ func prepareTLS(r *Rule, in *RuleTLS, ig *Group, old *Rule) error {
 }
 
 // prepareRule 校验输入并补全默认值。owner 是规则归属用户,old 为编辑时的原规则。
-// 调用方需持有 s.ruleMu:这里的"端口 / SNI 是否已被占用"检查与随后的写入必须是一个整体。
-func (s *Server) prepareRule(q dbq, actor, owner *User, in *ruleInput, old *Rule) (*Rule, error) {
+func (policy *rulePolicy) prepareRule(q dbq, actor, owner *User, in *ruleInput, old *Rule) (*Rule, error) {
 	r := &Rule{
 		UserID: owner.ID, Name: strings.TrimSpace(in.Name), InGroup: in.InGroup, OutGroup: in.OutGroup,
 		ListenPort: in.ListenPort, Proto: in.Proto, LB: in.LB, ProxyProtocol: in.ProxyProtocol,
@@ -489,60 +488,9 @@ func (s *Server) prepareRule(q dbq, actor, owner *User, in *ruleInput, old *Rule
 		}
 	}
 
-	all, err := listGroups(q)
-	if err != nil {
-		return nil, err
-	}
-	gs := toGroupSet(all)
-	usable := map[int64]bool{}
-	for _, g := range s.accessibleFrom(q, all, owner) {
-		usable[g.ID] = true
-	}
-	ig := gs[r.InGroup]
-	if ig == nil || ig.Type != proto.RoleIn || !usable[ig.ID] {
-		return nil, errors.New("入口组不存在或无权使用")
-	}
-	if !actor.IsAdmin() {
-		switch ig.Config.TLSInboundPolicy {
-		case 1:
-			if !isTLS {
-				return nil, errors.New("该入口组只允许 TLS 入站规则")
-			}
-		case 2:
-			if !isChild {
-				return nil, errors.New("该入口组只允许挂在共享 TLS 端口下的子规则")
-			}
-		}
-	}
-	if isTLS && containsStr(ig.Config.BlockedProtocols, "tls") {
-		return nil, errors.New("该入口组屏蔽了 TLS 协议,无法使用 TLS 入站")
-	}
-	if !isTLS && ig.Config.DisableUDP {
-		if r.Proto == "udp" {
-			return nil, errors.New("该入口组已禁用 UDP")
-		}
-		r.Proto = "tcp"
-	}
-	switch {
-	case isParent:
-	case r.OutGroup == 0:
-		if ig.Config.DirectMode == 1 && !actor.IsAdmin() {
-			return nil, errors.New("该入口组不允许直接转发,请选择出口组")
-		}
-	default:
-		if ig.Config.DirectMode == 2 {
-			return nil, errors.New("该入口组只允许直接转发")
-		}
-		og := gs[r.OutGroup]
-		if og == nil || (og.Type != proto.RoleOut && og.Type != proto.RoleChain) || !usable[og.ID] {
-			return nil, errors.New("出口不存在或无权使用")
-		}
-		if _, _, ok := gs.hops(og.ID); !ok {
-			return nil, errors.New("这个链式出口的配置不完整,暂时不能使用")
-		}
-		if len(ig.Config.AllowedOut) > 0 && !containsID(ig.Config.AllowedOut, r.OutGroup) {
-			return nil, errors.New("该入口组不允许使用所选出口")
-		}
+	ig := policy.groups[r.InGroup]
+	if ig == nil {
+		return nil, errors.New("入口组不存在")
 	}
 	if isTLS {
 		if err := prepareTLS(r, &in.TLS, ig, old); err != nil {
@@ -551,6 +499,9 @@ func (s *Server) prepareRule(q dbq, actor, owner *User, in *ruleInput, old *Rule
 	}
 
 	// 端口
+	if err := policy.authorize(owner, r); err != nil {
+		return nil, err
+	}
 	if isChild {
 		// 子规则不占端口:它挂在一个共享 TLS 端口(母规则)上,靠 SNI 区分
 		if r.ListenPort == 0 && old != nil && old.TLSMode == proto.TLSModeChild && old.InGroup == r.InGroup {
@@ -602,10 +553,7 @@ func (s *Server) prepareRule(q dbq, actor, owner *User, in *ruleInput, old *Rule
 		return r, nil
 	}
 
-	ranges, _ := parsePortRange(ig.Config.PortRange)
-	if len(ranges) == 0 {
-		ranges = [][2]int{{10000, 60000}}
-	}
+	ranges := rulePortRanges(ig)
 	taken := func(p int) bool {
 		var id int64
 		err := q.QueryRow(`SELECT id FROM rules WHERE in_group=? AND listen_port=? AND tls_mode<>'child'`, r.InGroup, p).Scan(&id)
@@ -641,12 +589,12 @@ func (s *Server) prepareRule(q dbq, actor, owner *User, in *ruleInput, old *Rule
 		if r.ListenPort < 1 || r.ListenPort > 65535 {
 			return nil, errors.New("监听端口无效")
 		}
-		if !actor.IsAdmin() && !portInRange(ranges, r.ListenPort) {
-			return nil, fmt.Errorf("监听端口需在 %s 范围内", ig.Config.PortRange)
-		}
 		if taken(r.ListenPort) {
 			return nil, errors.New("该端口已被其他规则占用")
 		}
+	}
+	if err := policy.authorize(owner, r); err != nil {
+		return nil, err
 	}
 	if r.Name == "" {
 		if r.Name = fmt.Sprintf("规则-%d", r.ListenPort); isParent {
@@ -706,11 +654,11 @@ func (s *Server) insertRule(q dbq, r *Rule) (int64, error) {
 }
 
 // ruleOwner 确定新规则归属:管理员可替其他用户创建。
-func (s *Server) ruleOwner(actor *User, userID int64) (*User, error) {
+func ruleOwner(q dbq, actor *User, userID int64) (*User, error) {
 	if userID == 0 || userID == actor.ID || !actor.IsAdmin() {
-		return actor, nil
+		userID = actor.ID
 	}
-	u, err := getUser(s.db, userID)
+	u, err := getUser(q, userID)
 	if err != nil {
 		return nil, errors.New("指定的用户不存在")
 	}
@@ -718,45 +666,28 @@ func (s *Server) ruleOwner(actor *User, userID int64) (*User, error) {
 }
 
 func (s *Server) checkQuota(owner *User, adding int) error {
-	if owner.IsAdmin() {
-		return nil
-	}
 	if !owner.Active() {
 		return errors.New("账号当前不可用(未购买套餐、已到期或流量用尽),无法创建规则")
 	}
-	if owner.RuleCount+adding > owner.MaxRules {
+	if !owner.IsAdmin() && owner.RuleCount+adding > owner.MaxRules {
 		return fmt.Errorf("规则数量已达上限(%d 条)", owner.MaxRules)
 	}
 	return nil
 }
 
 func (s *Server) handleRuleList(w http.ResponseWriter, r *http.Request, u *User) {
-	_, groups, err := s.hub.loadGroups()
+	policy, err := loadRulePolicy(s.db)
 	if err != nil {
 		s.dbErr(w, err)
 		return
 	}
-	// 母规则的状态决定挂在它下面的子规则能不能用
-	type parentState struct {
-		id     int64
-		usable bool
-	}
-	parents := map[[2]int64]parentState{}
-	prow, err := s.db.Query(`SELECT r.id, r.in_group, r.listen_port, (CASE WHEN r.paused=0 AND `+activeUserSQL+` THEN 1 ELSE 0 END)
-		FROM rules r JOIN users u ON u.id=r.user_id WHERE r.tls_mode='parent'`, now())
+	parents, err := policy.tlsParents(s.db)
 	if err != nil {
 		s.dbErr(w, err)
 		return
 	}
-	for prow.Next() {
-		var p parentState
-		var gid, port int64
-		prow.Scan(&p.id, &gid, &port, &p.usable)
-		parents[[2]int64{gid, port}] = p
-	}
-	prow.Close()
 
-	q := `SELECT ` + ruleCols + `, u.username, (CASE WHEN ` + activeUserSQL + ` THEN 1 ELSE 0 END) FROM rules r JOIN users u ON u.id=r.user_id`
+	q := `SELECT ` + ruleCols + `, u.username,u.role,u.plan_id, (CASE WHEN ` + activeUserSQL + ` THEN 1 ELSE 0 END), ` + ruleWithinQuotaSQL + ` FROM rules r JOIN users u ON u.id=r.user_id`
 	args := []any{now()}
 	if !(u.IsAdmin() && r.URL.Query().Get("all") == "1") {
 		q += ` WHERE r.user_id=?`
@@ -771,9 +702,10 @@ func (s *Server) handleRuleList(w http.ResponseWriter, r *http.Request, u *User)
 	online, errs := s.hub.onlineCount(), s.hub.ruleErrors()
 	out := []*Rule{}
 	for rows.Next() {
-		var active bool
+		var active, withinQuota bool
 		var username string
-		x, err := scanRule(rows, &username, &active)
+		var owner User
+		x, err := scanRule(rows, &username, &owner.Role, &owner.PlanID, &active, &withinQuota)
 		if err != nil {
 			s.dbErr(w, err)
 			return
@@ -781,28 +713,34 @@ func (s *Server) handleRuleList(w http.ResponseWriter, r *http.Request, u *User)
 		if u.IsAdmin() {
 			x.Username = username
 		}
+		runtimeRule := *x
+		policyErr := policy.authorize(&owner, &runtimeRule)
 		x.Status = "ok"
 		switch {
 		case x.Paused:
 			x.Status = "paused"
 		case !active:
 			x.Status, x.Error = "inactive", "账号不可用(到期、流量用尽或被封禁)"
+		case !withinQuota:
+			x.Status, x.Error = "inactive", "规则超出当前套餐数量上限"
+		case policyErr != nil:
+			x.Status, x.Error = "inactive", policyErr.Error()
 		case errs[x.ID] != "":
 			x.Status, x.Error = "error", errs[x.ID]
 		default:
 			if x.TLSMode == proto.TLSModeChild {
-				p, ok := parents[[2]int64{x.InGroup, int64(x.ListenPort)}]
+				p, ok := parents[x.parentKey()]
 				switch {
 				case !ok:
 					x.Status, x.Error = "error", fmt.Sprintf("共享 TLS 端口 %d 已被管理员删除", x.ListenPort)
 				case !p.usable:
-					x.Status, x.Error = "offline", fmt.Sprintf("共享 TLS 端口 %d 已被暂停", x.ListenPort)
+					x.Status, x.Error = "offline", fmt.Sprintf("共享 TLS 端口 %d 当前不可用", x.ListenPort)
 				case errs[p.id] != "":
 					x.Status, x.Error = "error", fmt.Sprintf("共享 TLS 端口 %d 同步失败: %s", x.ListenPort, errs[p.id])
 				}
 			}
 			if x.Status == "ok" {
-				if msg := ruleOffline(x, groups, online); msg != "" {
+				if msg := ruleOffline(x, policy.groups, online); msg != "" {
 					x.Status, x.Error = "offline", msg
 				}
 			}
@@ -820,7 +758,13 @@ func (s *Server) handleRuleCreate(w http.ResponseWriter, r *http.Request, u *Use
 	}
 	s.ruleMu.Lock()
 	defer s.ruleMu.Unlock()
-	owner, err := s.ruleOwner(u, in.UserID)
+	tx, err := s.db.Begin()
+	if err != nil {
+		s.dbErr(w, err)
+		return
+	}
+	defer tx.Rollback()
+	owner, err := ruleOwner(tx, u, in.UserID)
 	if err == nil {
 		err = s.checkQuota(owner, 1)
 	}
@@ -828,17 +772,26 @@ func (s *Server) handleRuleCreate(w http.ResponseWriter, r *http.Request, u *Use
 		s.fail(w, 400, err.Error())
 		return
 	}
-	rule, err := s.prepareRule(s.db, u, owner, &in, nil)
+	policy, err := loadRulePolicy(tx)
+	if err != nil {
+		s.dbErr(w, err)
+		return
+	}
+	rule, err := policy.prepareRule(tx, u, owner, &in, nil)
 	if err != nil {
 		s.fail(w, 400, err.Error())
 		return
 	}
-	id, err := s.insertRule(s.db, rule)
+	id, err := s.insertRule(tx, rule)
 	if err != nil {
 		s.fail(w, http.StatusConflict, "端口冲突,请重试")
 		return
 	}
-	s.dirtyRule(rule)
+	if err := tx.Commit(); err != nil {
+		s.dbErr(w, err)
+		return
+	}
+	s.hub.Dirty()
 	rule.ID = id
 	s.ok(w, rule.redact())
 }
@@ -876,7 +829,7 @@ func (s *Server) ownedRule(w http.ResponseWriter, r *http.Request, u *User) *Rul
 		s.dbErr(w, err)
 		return nil
 	}
-	if rule.UserID != u.ID && !u.IsAdmin() {
+	if !u.IsAdmin() && (rule.UserID != u.ID || rule.TLSMode == proto.TLSModeParent) {
 		s.fail(w, http.StatusForbidden, "无权操作该规则")
 		return nil
 	}
@@ -901,18 +854,32 @@ func (s *Server) handleRuleUpdate(w http.ResponseWriter, r *http.Request, u *Use
 	if old == nil {
 		return
 	}
-	owner, err := getUser(s.db, old.UserID)
-	if err != nil {
-		s.dbErr(w, err)
-		return
-	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		s.dbErr(w, err)
 		return
 	}
 	defer tx.Rollback()
-	rule, err := s.prepareRule(tx, u, owner, &in, old)
+	owner, err := getUser(tx, old.UserID)
+	if err != nil {
+		s.dbErr(w, err)
+		return
+	}
+	var withinQuota bool
+	if err := tx.QueryRow(`SELECT `+ruleWithinQuotaSQL+` FROM rules r JOIN users u ON u.id=r.user_id WHERE r.id=?`, old.ID).Scan(&withinQuota); err != nil {
+		s.dbErr(w, err)
+		return
+	}
+	if !withinQuota {
+		s.fail(w, 400, "规则超出当前套餐数量上限")
+		return
+	}
+	policy, err := loadRulePolicy(tx)
+	if err != nil {
+		s.dbErr(w, err)
+		return
+	}
+	rule, err := policy.prepareRule(tx, u, owner, &in, old)
 	if err != nil {
 		s.fail(w, 400, err.Error())
 		return
@@ -967,7 +934,7 @@ func (s *Server) handleRuleDelete(w http.ResponseWriter, r *http.Request, u *Use
 		s.dbErr(w, err)
 		return
 	}
-	s.dirtyRule(old)
+	s.hub.Dirty()
 	s.ok(w, H{"ok": true})
 }
 
@@ -987,7 +954,7 @@ func (s *Server) handleRulePause(w http.ResponseWriter, r *http.Request, u *User
 		s.dbErr(w, err)
 		return
 	}
-	s.dirtyRule(old)
+	s.hub.Dirty()
 	s.ok(w, H{"ok": true})
 }
 
@@ -999,6 +966,36 @@ func (s *Server) handleRuleDiag(w http.ResponseWriter, r *http.Request, u *User)
 	if rule.Paused {
 		s.ok(w, H{"hops": []proto.DiagHop{{From: "面板", To: "-", Error: "规则已暂停,恢复后才能诊断"}}})
 		return
+	}
+	owner, err := getUser(s.db, rule.UserID)
+	if err != nil {
+		s.dbErr(w, err)
+		return
+	}
+	policy, err := loadRulePolicy(s.db)
+	if err != nil {
+		s.dbErr(w, err)
+		return
+	}
+	var withinQuota bool
+	if err := s.db.QueryRow(`SELECT `+ruleWithinQuotaSQL+` FROM rules r JOIN users u ON u.id=r.user_id WHERE r.id=?`, rule.ID).Scan(&withinQuota); err != nil {
+		s.dbErr(w, err)
+		return
+	}
+	if !withinQuota || !owner.Active() || policy.authorize(owner, rule) != nil {
+		s.fail(w, http.StatusForbidden, "规则当前未获授权")
+		return
+	}
+	if rule.TLSMode == proto.TLSModeChild {
+		parents, err := policy.tlsParents(s.db)
+		if err != nil {
+			s.dbErr(w, err)
+			return
+		}
+		if !parents[rule.parentKey()].usable {
+			s.fail(w, http.StatusForbidden, "共享 TLS 端口当前不可用")
+			return
+		}
 	}
 	hops := s.hub.diag(rule)
 	if !u.IsAdmin() { // 普通用户不展示出口节点的真实地址
@@ -1035,17 +1032,26 @@ func (s *Server) handleRuleBatch(w http.ResponseWriter, r *http.Request, u *User
 	}
 	s.ruleMu.Lock()
 	defer s.ruleMu.Unlock()
-	if err := s.checkQuota(u, len(lines)); err != nil {
-		s.fail(w, 400, err.Error())
-		return
-	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		s.dbErr(w, err)
 		return
 	}
 	defer tx.Rollback()
-	var last *Rule
+	owner, err := getUser(tx, u.ID)
+	if err != nil {
+		s.dbErr(w, err)
+		return
+	}
+	if err = s.checkQuota(owner, len(lines)); err != nil {
+		s.fail(w, 400, err.Error())
+		return
+	}
+	policy, err := loadRulePolicy(tx)
+	if err != nil {
+		s.dbErr(w, err)
+		return
+	}
 	for i, l := range lines {
 		f := strings.Split(l, "#")
 		if len(f) != 4 {
@@ -1063,7 +1069,7 @@ func (s *Server) handleRuleBatch(w http.ResponseWriter, r *http.Request, u *User
 			Name: f[0], InGroup: in.InGroup, OutGroup: in.OutGroup, ListenPort: port, Proto: in.Proto,
 			Targets: []string{net.JoinHostPort(strings.TrimSpace(f[2]), strings.TrimSpace(f[3]))},
 		}
-		rule, err := s.prepareRule(tx, u, u, &ri, nil)
+		rule, err := policy.prepareRule(tx, u, owner, &ri, nil)
 		if err == nil {
 			_, err = s.insertRule(tx, rule)
 		}
@@ -1071,12 +1077,11 @@ func (s *Server) handleRuleBatch(w http.ResponseWriter, r *http.Request, u *User
 			s.fail(w, 400, fmt.Sprintf("第 %d 行: %v", i+1, err))
 			return
 		}
-		last = rule
 	}
 	if err := tx.Commit(); err != nil {
 		s.dbErr(w, err)
 		return
 	}
-	s.dirtyRule(last)
+	s.hub.Dirty()
 	s.ok(w, H{"created": len(lines)})
 }

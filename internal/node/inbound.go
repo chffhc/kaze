@@ -73,11 +73,16 @@ func newInbound(a *Agent) *inbound {
 func (in *inbound) apply(cfg *proto.InboundConfig) {
 	in.mu.Lock()
 	defer in.mu.Unlock()
+	in.applyLocked(cfg)
+}
+
+func (in *inbound) applyLocked(cfg *proto.InboundConfig) {
+	previous := in.last
 	in.last = cfg
 
 	// 1. 反向隧道监听,以及到各出口组的隧道客户端
 	in.applyReverseLocked(cfg.Reverse)
-	in.tunnels.apply(cfg.Tunnels, tunnel.ClientOpts{
+	tunnelChanges := in.tunnels.apply(cfg.Tunnels, tunnel.ClientOpts{
 		MaxFail: cfg.MaxFail, FailTimeout: time.Duration(cfg.FailTimeout) * time.Second, Now: in.a.now, Reverse: in.rev,
 	})
 
@@ -94,6 +99,9 @@ func (in *inbound) apply(cfg *proto.InboundConfig) {
 	}
 
 	// 3. 全局策略
+	policyChanged := previous != nil && (previous.AllowPrivate && !cfg.AllowPrivate ||
+		!slices.Equal(previous.BlockedProtocols, cfg.BlockedProtocols) || !slices.Equal(previous.BlockedHosts, cfg.BlockedHosts) ||
+		!slices.Equal(previous.AllowedHosts, cfg.AllowedHosts) || !previous.TLSRejectEmptySNI && cfg.TLSRejectEmptySNI)
 	in.policy.Store(relay.NewSniffPolicy(cfg.BlockedProtocols, cfg.BlockedHosts, cfg.AllowedHosts))
 	in.rejectEmptySNI.Store(cfg.TLSRejectEmptySNI)
 	if d := in.dialer.Load(); d.AllowPrivate != cfg.AllowPrivate {
@@ -102,8 +110,8 @@ func (in *inbound) apply(cfg *proto.InboundConfig) {
 
 	// 4. 规则
 	want := make(map[int64]*proto.Rule, len(cfg.Rules))
-	for i := range cfg.Rules {
-		r := &cfg.Rules[i]
+	for _, spec := range cfg.Rules {
+		r := &spec
 		if r.TLS != nil {
 			r.Proto = "tcp" // TLS 入站只有 TCP
 		} else if cfg.DisableUDP {
@@ -122,7 +130,7 @@ func (in *inbound) apply(cfg *proto.InboundConfig) {
 				ul = ue.lim
 			}
 		}
-		if w == nil || !reflect.DeepEqual(run.spec, *w) || run.ulim != ul {
+		if w == nil || policyChanged || tunnelChanges[run.spec.OutGroup] || run.ulim != ul || !run.updateParentCertificate(*w) {
 			in.stopLocked(id, run)
 		}
 	}
@@ -245,38 +253,37 @@ func (in *inbound) stopLocked(id int64, run *ruleRunner) {
 // retryFailed 重新尝试启动失败的规则(例如端口被占用后又释放),以及没能监听成功的反向隧道端口。
 func (in *inbound) retryFailed() bool {
 	in.mu.Lock()
-	n, cfg := len(in.errs), in.last
-	if in.revErr != "" {
-		n++
-	}
-	in.mu.Unlock()
-	if n == 0 || cfg == nil {
+	defer in.mu.Unlock()
+	if (len(in.errs) == 0 && in.revErr == "") || in.last == nil {
 		return false
 	}
-	in.apply(cfg)
+	in.applyLocked(in.last)
 	return true
 }
 
 // collect 取走自上次以来的流量增量。
 func (in *inbound) collect() []proto.Traffic {
+	var out []proto.Traffic
+	in.collectIf(func(v proto.Traffic) bool { out = append(out, v); return true })
+	return out
+}
+
+// Subtract only accepted snapshots. Concurrent per-packet increments remain live.
+func (in *inbound) collectIf(take func(proto.Traffic) bool) {
 	in.mu.Lock()
 	defer in.mu.Unlock()
-	var out []proto.Traffic
-	for id, run := range in.rules {
-		up, down := run.up.Swap(0), run.down.Swap(0)
-		if o, ok := in.orphan[id]; ok {
-			up, down = up+o[0], down+o[1]
+	for id, o := range in.orphan {
+		if o == [2]int64{} || take(proto.Traffic{RuleID: id, Up: o[0], Down: o[1]}) {
 			delete(in.orphan, id)
 		}
-		if up != 0 || down != 0 {
-			out = append(out, proto.Traffic{RuleID: id, Up: up, Down: down})
+	}
+	for id, run := range in.rules {
+		up, down := run.up.Load(), run.down.Load()
+		if (up != 0 || down != 0) && take(proto.Traffic{RuleID: id, Up: up, Down: down}) {
+			run.up.Add(-up)
+			run.down.Add(-down)
 		}
 	}
-	for id, o := range in.orphan {
-		out = append(out, proto.Traffic{RuleID: id, Up: o[0], Down: o[1]})
-		delete(in.orphan, id)
-	}
-	return out
 }
 
 // ruleErrors 返回启动失败的规则;键 0 是节点级的错误(反向隧道监听失败)。
@@ -307,6 +314,8 @@ func (in *inbound) reverseStatus() (total, up int) {
 func (in *inbound) stopAll() {
 	in.mu.Lock()
 	defer in.mu.Unlock()
+	in.last = nil
+	clear(in.errs)
 	for id, run := range in.rules {
 		in.stopLocked(id, run)
 	}
@@ -344,11 +353,13 @@ func (in *inbound) diag(ruleID int64) []proto.DiagHop {
 // ---- 单条规则 ----
 
 type ruleRunner struct {
-	in   *inbound
-	spec proto.Rule
-	ulim *relay.Limits // 用户级
-	rlim *relay.Limits // 规则级
-	bal  *relay.Balancer
+	configured proto.Rule // guarded by in.mu
+	udpDone    chan struct{}
+	in         *inbound
+	spec       proto.Rule
+	ulim       *relay.Limits // 用户级
+	rlim       *relay.Limits // 规则级
+	bal        *relay.Balancer
 
 	up, down atomic.Int64
 
@@ -356,13 +367,10 @@ type ruleRunner struct {
 	cert    *tls.Certificate // 规则配置的证书,或启动时自动生成的自签名证书
 	ownCert bool             // 证书来自规则配置
 	self    *sniTarget       // 独占端口时:握手归属就是自己
-	outer   *tls.Config      // 监听端口上的握手入口,按 SNI 选出真正的服务端配置
 
-	tcpLn  net.Listener
-	udp    *relay.UDPRelay
-	mu     sync.Mutex
-	conns  map[net.Conn]struct{}
-	closed atomic.Bool
+	tcpLn net.Listener
+	udp   *relay.UDPRelay
+	live  *ruleConns
 }
 
 func (r *ruleRunner) tlsMode() string {
@@ -419,9 +427,8 @@ func (r *ruleRunner) loadTLS() error {
 
 func (in *inbound) startRule(spec proto.Rule, ulim *relay.Limits, cfg *proto.InboundConfig) (*ruleRunner, error) {
 	r := &ruleRunner{
-		in: in, spec: spec, ulim: ulim,
-		rlim:  relay.NewLimits(spec.SpeedLimit, spec.ConnLimit, spec.IPLimit),
-		conns: make(map[net.Conn]struct{}),
+		in: in, spec: spec, configured: spec, ulim: ulim, live: newRuleConns(),
+		rlim: relay.NewLimits(spec.SpeedLimit, spec.ConnLimit, spec.IPLimit),
 	}
 	mode := r.tlsMode()
 	switch mode {
@@ -448,16 +455,6 @@ func (in *inbound) startRule(spec proto.Rule, ulim *relay.Limits, cfg *proto.Inb
 	}
 	if mode != "" {
 		r.self = &sniTarget{r: r, cfg: serverTLSConfig(r.cert, spec.TLS.ALPN)}
-		r.outer = &tls.Config{
-			MinVersion: tls.VersionTLS12,
-			GetConfigForClient: func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
-				t, err := r.route(strings.ToLower(chi.ServerName))
-				if err != nil {
-					return nil, err
-				}
-				return t.cfg, nil
-			},
-		}
 	}
 
 	addr := net.JoinHostPort(in.a.opt.Bind, fmt.Sprint(spec.ListenPort))
@@ -488,7 +485,10 @@ func (in *inbound) startRule(spec proto.Rule, ulim *relay.Limits, cfg *proto.Inb
 			DownLimits: [2]*relay.Bucket{bucketDown(r.rlim), bucketDown(r.ulim)},
 			Open:       r.openUDP,
 		}
-		go r.udp.Serve()
+	}
+	if r.udp != nil {
+		r.udpDone = make(chan struct{})
+		go func() { defer close(r.udpDone); r.udp.Serve() }()
 	}
 	if r.tcpLn != nil {
 		go r.serveTCP()
@@ -496,51 +496,57 @@ func (in *inbound) startRule(spec proto.Rule, ulim *relay.Limits, cfg *proto.Inb
 	return r, nil
 }
 
-func (r *ruleRunner) stop() {
-	if r.closed.Swap(true) {
-		return
+// A certificate-only renewal changes future handshakes, not established child streams.
+func (r *ruleRunner) updateParentCertificate(next proto.Rule) bool {
+	current := r.configured
+	if reflect.DeepEqual(current, next) {
+		return true
 	}
+	if r.tlsMode() != proto.TLSModeParent || next.TLS == nil || next.TLS.Mode != proto.TLSModeParent {
+		return false
+	}
+	currentTLS, nextTLS := *current.TLS, *next.TLS
+	currentTLS.CertPEM, currentTLS.KeyPEM = "", ""
+	nextTLS.CertPEM, nextTLS.KeyPEM = "", ""
+	current.TLS = &currentTLS
+	config := next
+	config.TLS = &nextTLS
+	if !reflect.DeepEqual(current, config) {
+		return false
+	}
+	replacement := ruleRunner{spec: next}
+	if err := replacement.loadTLS(); err != nil {
+		return false
+	}
+	r.cert, r.ownCert = replacement.cert, replacement.ownCert
+	r.configured = next
+	return true
+}
+
+func (r *ruleRunner) stop() {
+	r.live.stop()
 	if r.tcpLn != nil {
 		r.tcpLn.Close()
 	}
 	if r.udp != nil {
 		r.udp.Close()
+		<-r.udpDone
+		r.udp.Wait()
 	}
-	r.mu.Lock()
-	for c := range r.conns {
-		c.Close()
-	}
-	r.mu.Unlock()
-}
-
-// track 登记一条属于本规则的连接;规则停止时会把它们全部关闭。
-func (r *ruleRunner) track(c net.Conn) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.closed.Load() {
-		return false
-	}
-	r.conns[c] = struct{}{}
-	return true
-}
-
-func (r *ruleRunner) untrack(c net.Conn) {
-	r.mu.Lock()
-	delete(r.conns, c)
-	r.mu.Unlock()
+	r.live.workers.Wait()
 }
 
 func (r *ruleRunner) serveTCP() {
 	for {
 		c, err := r.tcpLn.Accept()
 		if err != nil {
-			if r.closed.Load() {
+			if r.live.ctx.Err() != nil {
 				return
 			}
 			time.Sleep(20 * time.Millisecond) // 文件描述符耗尽等瞬时错误
 			continue
 		}
-		if r.outer != nil {
+		if r.self != nil {
 			go r.handleTLS(c)
 		} else {
 			go r.serve(c, addrPortOf(c.RemoteAddr()), true, "")
@@ -585,15 +591,26 @@ func (r *ruleRunner) route(sni string) (*sniTarget, error) {
 // handleTLS 在监听端口上终结 TLS,然后把内层的明文连接交给握手归属的规则。
 func (r *ruleRunner) handleTLS(c net.Conn) {
 	src := addrPortOf(c.RemoteAddr())
-	if !r.track(c) { // 握手期间的连接记在监听它的规则名下
+	if !r.live.track(c) { // 握手期间的连接记在监听它的规则名下
 		c.Close()
 		return
 	}
-	tc := tls.Server(c, r.outer)
-	ctx, cancel := context.WithTimeout(context.Background(), tlsHandshakeTimeout)
+	defer r.live.forget(c)
+	var selected *ruleRunner
+	tc := tls.Server(c, &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		GetConfigForClient: func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
+			t, err := r.route(strings.ToLower(chi.ServerName))
+			if err != nil {
+				return nil, err
+			}
+			selected = t.r
+			return t.cfg, nil
+		},
+	})
+	ctx, cancel := context.WithTimeout(r.live.ctx, tlsHandshakeTimeout)
 	err := tc.HandshakeContext(ctx)
 	cancel()
-	r.untrack(c)
 	if err != nil {
 		c.Close()
 		return
@@ -601,7 +618,7 @@ func (r *ruleRunner) handleTLS(c net.Conn) {
 	cs := tc.ConnectionState()
 	t, err := r.route(strings.ToLower(cs.ServerName))
 	// 规则要求了 ALPN 时,没有声明 ALPN 的客户端也不接受(声明了但没有交集的在握手阶段就失败了)
-	if err != nil || (len(t.r.spec.TLS.ALPN) > 0 && cs.NegotiatedProtocol == "") {
+	if err != nil || t.r != selected || (len(t.r.spec.TLS.ALPN) > 0 && cs.NegotiatedProtocol == "") {
 		tc.Close()
 		return
 	}
@@ -616,11 +633,11 @@ func (r *ruleRunner) serve(c net.Conn, src netip.AddrPort, sniff bool, alpn stri
 		return
 	}
 	defer relay.ReleaseAll(src.Addr(), r.rlim, r.ulim)
-	if !r.track(c) {
-		c.Close()
+
+	if !r.live.start(c) {
 		return
 	}
-	defer r.untrack(c)
+	defer r.live.finish(c)
 
 	var prefix []byte
 	if sniff {
@@ -633,7 +650,7 @@ func (r *ruleRunner) serve(c net.Conn, src netip.AddrPort, sniff bool, alpn stri
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
+	ctx, cancel := context.WithTimeout(r.live.ctx, connectTimeout)
 	var target net.Conn
 	var done func()
 	var err error
@@ -663,17 +680,22 @@ func (r *ruleRunner) serve(c net.Conn, src netip.AddrPort, sniff bool, alpn stri
 		c.Close()
 		return
 	}
+	defer done()
+	if !r.live.track(target) {
+		return
+	}
+	defer r.live.forget(target)
 	relay.Pipe(c, target, &relay.PipeOpts{
-		Up: &r.up, Down: &r.down,
+		Context: r.live.ctx,
+		Up:      &r.up, Down: &r.down,
 		UpLimits:   [2]*relay.Bucket{bucketUp(r.rlim), bucketUp(r.ulim)},
 		DownLimits: [2]*relay.Bucket{bucketDown(r.rlim), bucketDown(r.ulim)},
 		Prefix:     prefix,
 	})
-	done()
 }
 
 func (r *ruleRunner) openUDP(client netip.AddrPort, _ uint32) (relay.Upstream, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
+	ctx, cancel := context.WithTimeout(r.live.ctx, connectTimeout)
 	defer cancel()
 	if r.spec.OutGroup == 0 {
 		cands := r.bal.Candidates(relay.HashAddr(client.Addr()))

@@ -40,8 +40,6 @@ type Hub struct {
 	kick     chan struct{}
 
 	version atomic.Int64
-	seqMu   sync.Mutex
-	lastSeq map[string]int64
 
 	diagMu   sync.Mutex
 	diagWait map[string]chan proto.DiagResult
@@ -70,7 +68,7 @@ type nodeConn struct {
 func newHub(s *Server) *Hub {
 	return &Hub{
 		s: s, conns: make(map[string]*nodeConn), dirty: make(map[int64]bool),
-		kick: make(chan struct{}, 1), lastSeq: make(map[string]int64),
+		kick:     make(chan struct{}, 1),
 		diagWait: make(map[string]chan proto.DiagResult),
 	}
 }
@@ -440,10 +438,13 @@ func nextHopKey(groupID int64, mux bool) int64 {
 }
 
 func (h *Hub) buildConfig(groupID int64) (*proto.NodeConfig, error) {
-	all, groups, err := h.loadGroups()
+	db := h.s.db
+	policy, err := loadRulePolicy(db)
 	if err != nil {
 		return nil, err
 	}
+	groups := policy.groups
+	all := policy.all
 	g := groups[groupID]
 	if g == nil {
 		return nil, fmt.Errorf("设备组不存在")
@@ -451,9 +452,9 @@ func (h *Hub) buildConfig(groupID int64) (*proto.NodeConfig, error) {
 	cfg := &proto.NodeConfig{Role: g.Type, GroupID: g.ID, ReportInterval: reportInterval}
 	switch g.Type {
 	case proto.RoleIn:
-		cfg.Inbound, err = h.buildInbound(g, all, groups)
+		cfg.Inbound, err = h.buildInbound(g, all, policy)
 	case proto.RoleOut:
-		cfg.Outbound, err = h.buildOutbound(g, all, groups)
+		cfg.Outbound, err = h.buildOutbound(g, all, policy)
 	default:
 		err = fmt.Errorf("设备组 #%d 不是入口组或出口组,不能对接节点", g.ID)
 	}
@@ -463,7 +464,12 @@ func (h *Hub) buildConfig(groupID int64) (*proto.NodeConfig, error) {
 	return cfg, nil
 }
 
-func (h *Hub) buildInbound(g *Group, all []*Group, groups groupSet) (*proto.InboundConfig, error) {
+func (h *Hub) buildInbound(g *Group, all []*Group, policy *rulePolicy) (*proto.InboundConfig, error) {
+	parents, err := policy.tlsParents(h.s.db)
+	if err != nil {
+		return nil, err
+	}
+	groups := policy.groups
 	gc := &g.Config
 	in := &proto.InboundConfig{
 		Rules: []proto.Rule{}, Users: map[int64]proto.UserLimit{}, Tunnels: map[int64]*proto.TunnelSpec{},
@@ -483,17 +489,21 @@ func (h *Hub) buildInbound(g *Group, all []*Group, groups groupSet) (*proto.Inbo
 			in.Reverse = &proto.ReverseListen{CertPEM: gc.RevCertPEM, KeyPEM: gc.RevKeyPEM, Groups: allowed}
 		}
 	}
-	rows, err := h.s.db.Query(`SELECT `+ruleCols+`,u.speed_limit,u.conn_limit,u.ip_limit FROM rules r
-		JOIN users u ON u.id=r.user_id WHERE r.in_group=? AND r.paused=0 AND `+activeUserSQL+` ORDER BY r.id`, g.ID, now())
+	rows, err := h.s.db.Query(`SELECT `+ruleCols+`,u.speed_limit,u.conn_limit,u.ip_limit,u.role,u.plan_id FROM rules r
+		JOIN users u ON u.id=r.user_id WHERE r.in_group=? AND r.paused=0 AND `+activeUserSQL+` AND `+ruleWithinQuotaSQL+` ORDER BY r.id`, g.ID, now())
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var us, uc, ui int
-		r, err := scanRule(rows, &us, &uc, &ui)
+		var owner User
+		r, err := scanRule(rows, &us, &uc, &ui, &owner.Role, &owner.PlanID)
 		if err != nil {
 			return nil, err
+		}
+		if policy.authorize(&owner, r) != nil || r.TLSMode == proto.TLSModeChild && !parents[r.parentKey()].usable {
+			continue
 		}
 		pr := proto.Rule{
 			ID: r.ID, UserID: r.UserID, ListenPort: r.ListenPort, Proto: r.Proto,
@@ -504,6 +514,14 @@ func (h *Hub) buildInbound(g *Group, all []*Group, groups groupSet) (*proto.Inbo
 			hops, chain, ok := groups.hops(r.OutGroup)
 			// 回源 TLS 由最后一跳执行。经隧道时也告诉入口一声:它据此决定要不要把协商出的 ALPN 带给最后一跳。
 			pr.OriginTLS = r.originTLS()
+			if len(hops) > 0 {
+				var hopIDs []int64
+				for _, hop := range hops {
+					hopIDs = append(hopIDs, hop.ID)
+				}
+				route, _ := json.Marshal([]any{r.OutGroup, hopIDs, r.Targets, r.ProxyProtocol, chain != nil && chain.Config.ChainMux})
+				pr.RouteFingerprint = fmt.Sprintf("%x", sha256.Sum256(route))
+			}
 			switch {
 			case !ok:
 				continue
@@ -529,7 +547,12 @@ func (h *Hub) buildInbound(g *Group, all []*Group, groups groupSet) (*proto.Inbo
 	return in, rows.Err()
 }
 
-func (h *Hub) buildOutbound(g *Group, all []*Group, groups groupSet) (*proto.OutboundConfig, error) {
+func (h *Hub) buildOutbound(g *Group, all []*Group, policy *rulePolicy) (*proto.OutboundConfig, error) {
+	parents, err := policy.tlsParents(h.s.db)
+	if err != nil {
+		return nil, err
+	}
+	groups := policy.groups
 	gc := &g.Config
 	out := &proto.OutboundConfig{
 		ListenPort: gc.TunnelPort, Transport: gc.Transport, Key: gc.TunnelKey, Path: gc.WSPath,
@@ -582,16 +605,20 @@ func (h *Hub) buildOutbound(g *Group, all []*Group, groups groupSet) (*proto.Out
 			ids, ph = append(ids, og.ID), ph+",?"
 		}
 	}
-	rows, err := h.s.db.Query(`SELECT `+ruleCols+` FROM rules r JOIN users u ON u.id=r.user_id
-		WHERE r.out_group IN (`+ph+`) AND r.paused=0 AND r.tls_mode<>'parent' AND `+activeUserSQL+` ORDER BY r.id`, append(ids, now())...)
+	rows, err := h.s.db.Query(`SELECT `+ruleCols+`,u.role,u.plan_id FROM rules r JOIN users u ON u.id=r.user_id
+		WHERE r.out_group IN (`+ph+`) AND r.paused=0 AND r.tls_mode<>'parent' AND `+activeUserSQL+` AND `+ruleWithinQuotaSQL+` ORDER BY r.id`, append(ids, now())...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	for rows.Next() {
-		r, err := scanRule(rows)
+		var owner User
+		r, err := scanRule(rows, &owner.Role, &owner.PlanID)
 		if err != nil {
 			return nil, err
+		}
+		if policy.authorize(&owner, r) != nil || r.TLSMode == proto.TLSModeChild && !parents[r.parentKey()].usable {
+			continue
 		}
 		hops, chain, ok := groups.hops(r.OutGroup)
 		if !ok || len(hops) == 0 {
@@ -734,13 +761,11 @@ func (h *Hub) serveWS(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	if cfg, err := h.buildConfig(g.ID); err == nil {
-		h.pushConfig(c, cfg, true)
-	} else {
-		log.Printf("[hub] 生成配置失败: %v", err)
-	}
+	// Initial and subsequent configurations go through the same ordered builder.
 	if g.Type == proto.RoleOut || revChanged {
-		h.Dirty() // 出口节点上线,或入口的反向端口有变化:对端的连接地址列表可能变化
+		h.Dirty()
+	} else {
+		h.Dirty(g.ID)
 	}
 
 	lastTouch := t
@@ -765,26 +790,16 @@ func (h *Hub) serveWS(w http.ResponseWriter, r *http.Request) {
 				lastTouch = n
 				h.s.db.Exec(`UPDATE nodes SET last_seen=? WHERE id=?`, n, c.nodeID)
 			}
-		case proto.TReport:
+		case proto.TReport, proto.TReportV2:
 			var rep proto.Report
-			if json.Unmarshal(m.D, &rep) != nil {
+			if g.Type != proto.RoleIn || json.Unmarshal(m.D, &rep) != nil || (m.T == proto.TReportV2) != (rep.Stream != "") {
 				continue
 			}
-			if g.Type == proto.RoleIn {
-				h.seqMu.Lock()
-				dup := h.lastSeq[c.key] == rep.Seq
-				h.seqMu.Unlock()
-				if !dup {
-					if err := h.ingest(g.ID, &rep); err != nil {
-						log.Printf("[hub] 流量入库失败: %v", err)
-						continue // 不确认,节点稍后会重发
-					}
-					h.seqMu.Lock()
-					h.lastSeq[c.key] = rep.Seq
-					h.seqMu.Unlock()
-				}
+			if err := h.ingest(g.ID, c.hello.UID, &rep); err != nil {
+				log.Printf("[hub] 入口 #%d 流量未确认: %v", g.ID, err)
+				continue
 			}
-			c.trySend(proto.Pack(proto.TAck, proto.Ack{Seq: rep.Seq}))
+			c.trySend(proto.Pack(proto.TAck, proto.Ack{Seq: rep.Seq, Stream: rep.Stream}))
 		case proto.TStatus:
 			var st proto.Status
 			if json.Unmarshal(m.D, &st) != nil {
@@ -816,92 +831,6 @@ func (h *Hub) serveWS(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-}
-
-// ingest 把一次流量上报入库:规则流量、用户已用流量(按倍率)、设备组流量、小时统计。
-// 计费口径:用户扣除 = 实际流量 ×(入口倍率 + 出口倍率),直出只计入口倍率;
-// 链式出口取链式出口自己的倍率,不累加途经各出口组的倍率。
-func (h *Hub) ingest(inGroupID int64, rep *proto.Report) error {
-	if len(rep.Items) == 0 {
-		return nil
-	}
-	db := h.s.db
-	ratios := map[int64]float64{}
-	chainHops := map[int64][]int64{}
-	rows, err := db.Query(`SELECT id, ratio, type, config FROM device_groups`)
-	if err != nil {
-		return err
-	}
-	for rows.Next() {
-		var id int64
-		var r float64
-		var typ, cfg string
-		rows.Scan(&id, &r, &typ, &cfg)
-		ratios[id] = r
-		if typ == proto.RoleChain {
-			var c struct {
-				ChainHops []int64 `json:"chain_hops"`
-			}
-			json.Unmarshal([]byte(cfg), &c)
-			chainHops[id] = c.ChainHops
-		}
-	}
-	rows.Close()
-
-	tx, err := db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	hour := now() / 3600 * 3600
-	crossed := false
-	for _, it := range rep.Items {
-		if it.Up < 0 || it.Down < 0 || it.Up+it.Down == 0 {
-			continue
-		}
-		var uid, outGroup int64
-		err := tx.QueryRow(`UPDATE rules SET traffic_up=traffic_up+?, traffic_down=traffic_down+? WHERE id=? AND in_group=?
-			RETURNING user_id, out_group`, it.Up, it.Down, it.RuleID, inGroupID).Scan(&uid, &outGroup)
-		if err != nil {
-			continue // 规则已删除
-		}
-		raw := it.Up + it.Down
-		ratio := ratios[inGroupID]
-		if outGroup != 0 {
-			ratio += ratios[outGroup]
-		}
-		billed := int64(float64(raw) * ratio)
-		var used, quota int64
-		var role string
-		if err := tx.QueryRow(`UPDATE users SET traffic_used=traffic_used+? WHERE id=? RETURNING traffic_used, traffic_quota, role`,
-			billed, uid).Scan(&used, &quota, &role); err == nil {
-			if role != "admin" && used >= quota && used-billed < quota {
-				crossed = true
-			}
-		}
-		if _, err := tx.Exec(`INSERT INTO traffic_hourly(user_id,hour,up,down,billed) VALUES(?,?,?,?,?)
-			ON CONFLICT(user_id,hour) DO UPDATE SET up=up+excluded.up, down=down+excluded.down, billed=billed+excluded.billed`,
-			uid, hour, it.Up, it.Down, billed); err != nil {
-			return err
-		}
-		if _, err := tx.Exec(`UPDATE device_groups SET traffic=traffic+? WHERE id=? OR (id=? AND ?<>0)`,
-			raw, inGroupID, outGroup, outGroup); err != nil {
-			return err
-		}
-		// 链式出口:途经的每个出口组也记上这笔流量(只影响设备组的累计流量,不影响用户计费)
-		for _, hid := range chainHops[outGroup] {
-			if _, err := tx.Exec(`UPDATE device_groups SET traffic=traffic+? WHERE id=?`, raw, hid); err != nil {
-				return err
-			}
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	if crossed {
-		h.Dirty() // 有用户流量用尽:停掉其规则
-	}
-	return nil
 }
 
 // ---- 查询 ----

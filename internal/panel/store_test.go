@@ -559,3 +559,34 @@ func TestWithoutReverse(t *testing.T) {
 		t.Fatal("withoutReverse 修改了原配置")
 	}
 }
+
+func TestMigrateV2Ledger(t *testing.T) {
+	dir := t.TempDir()
+	db, err := openDB(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := insertTestRule(db, 900, 443, proto.TLSModeParent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`DROP TABLE traffic_cursors; DROP TABLE traffic_unattributed; PRAGMA user_version=2`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = openDB(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if got := scalar[string](t, db, `SELECT tls_mode FROM rules WHERE id=?`, id); got != proto.TLSModeParent {
+		t.Fatal(got)
+	}
+	for _, table := range []string{"traffic_cursors", "traffic_unattributed"} {
+		if n := scalar[int](t, db, `SELECT COUNT(*) FROM sqlite_master WHERE name=? AND type='table'`, table); n != 1 {
+			t.Fatal(table)
+		}
+	}
+}

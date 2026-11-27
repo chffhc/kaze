@@ -50,7 +50,8 @@ func usesReverse(s *proto.TunnelSpec) bool {
 }
 
 // apply 收敛到 specs:配置没变的客户端原样保留(连接不受影响),变了的退役后重建,多余的退役。
-func (ts *tunnelSet) apply(specs map[int64]*proto.TunnelSpec, o tunnel.ClientOpts) {
+func (ts *tunnelSet) apply(specs map[int64]*proto.TunnelSpec, o tunnel.ClientOpts) map[int64]bool {
+	changed := make(map[int64]bool)
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
 	for gid, spec := range specs {
@@ -62,7 +63,8 @@ func (ts *tunnelSet) apply(specs map[int64]*proto.TunnelSpec, o tunnel.ClientOpt
 				(!usesReverse(spec) || old.opts.Reverse == o.Reverse) {
 				continue
 			}
-			old.cli.Retire()
+			old.cli.Close()
+			changed[gid] = true
 			delete(ts.entries, gid)
 		}
 		cli, err := tunnel.NewClient(spec, o)
@@ -71,10 +73,12 @@ func (ts *tunnelSet) apply(specs map[int64]*proto.TunnelSpec, o tunnel.ClientOpt
 			continue
 		}
 		ts.entries[gid] = &tunnelEntry{spec: *spec, opts: o, cli: cli}
+		changed[gid] = true
 	}
 	for gid, old := range ts.entries {
 		if specs[gid] == nil {
-			old.cli.Retire()
+			old.cli.Close()
+			changed[gid] = true
 			delete(ts.entries, gid)
 		}
 	}
@@ -83,6 +87,7 @@ func (ts *tunnelSet) apply(specs map[int64]*proto.TunnelSpec, o tunnel.ClientOpt
 		m[gid] = e.cli
 	}
 	ts.cur.Store(&m)
+	return changed
 }
 
 func (ts *tunnelSet) get(gid int64) *tunnel.Client { return (*ts.cur.Load())[gid] }

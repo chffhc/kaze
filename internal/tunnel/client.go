@@ -359,6 +359,9 @@ func (c *Client) Retire() {
 func (c *Client) Close() {
 	c.Retire()
 	c.reap(true)
+	if c.fallback != nil {
+		c.fallback.Close()
+	}
 }
 
 // ---- 复用会话池 ----

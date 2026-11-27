@@ -39,6 +39,7 @@ type outbound struct {
 
 type outRule struct {
 	spec proto.OutRule
+	live *ruleConns
 	bal  *relay.Balancer // 仅最后一跳
 }
 
@@ -61,27 +62,34 @@ func (o *outbound) apply(cfg *proto.OutboundConfig, groupID int64) error {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 
+	privateRevoked := o.dialer.Load().AllowPrivate && !cfg.AllowPrivate
+	if d := o.dialer.Load(); d.AllowPrivate != cfg.AllowPrivate {
+		o.dialer.Store(relay.NewDialer(cfg.AllowPrivate))
+	}
+	tunnelChanges := o.tunnels.apply(cfg.Tunnels, tunnel.ClientOpts{
+		MaxFail: cfg.MaxFail, FailTimeout: time.Duration(cfg.FailTimeout) * time.Second, Now: o.a.now,
+	})
+
 	// 规则表:内容没变的规则沿用原对象,保留均衡器里的健康状态。
 	old := *o.rules.Load()
 	next := make(map[int64]*outRule, len(cfg.Rules))
 	for _, r := range cfg.Rules {
-		if prev := old[r.ID]; prev != nil && reflect.DeepEqual(prev.spec, r) {
+		if prev := old[r.ID]; prev != nil && !privateRevoked && !tunnelChanges[r.Next] && reflect.DeepEqual(prev.spec, r) {
 			next[r.ID] = prev
 			continue
 		}
-		or := &outRule{spec: r}
+		or := &outRule{spec: r, live: newRuleConns()}
 		if r.Next == 0 {
 			or.bal = relay.NewBalancer(r.Targets, r.LB, cfg.MaxFail, time.Duration(cfg.FailTimeout)*time.Second)
 		}
 		next[r.ID] = or
 	}
 	o.rules.Store(&next)
-	if d := o.dialer.Load(); d.AllowPrivate != cfg.AllowPrivate {
-		o.dialer.Store(relay.NewDialer(cfg.AllowPrivate))
+	for id, prev := range old {
+		if next[id] != prev {
+			prev.live.stop()
+		}
 	}
-	o.tunnels.apply(cfg.Tunnels, tunnel.ClientOpts{
-		MaxFail: cfg.MaxFail, FailTimeout: time.Duration(cfg.FailTimeout) * time.Second, Now: o.a.now,
-	})
 
 	keys, err := tunnel.DeriveKeys(cfg.Key)
 	if err != nil {
@@ -202,11 +210,12 @@ func (o *outbound) closeServerLocked() {
 func (o *outbound) stopAll() {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	for _, rule := range *o.rules.Swap(&map[int64]*outRule{}) {
+		rule.live.stop()
+	}
 	o.closeServerLocked()
 	o.closeReverseLocked()
 	o.tunnels.closeAll()
-	empty := map[int64]*outRule{}
-	o.rules.Store(&empty)
 }
 
 func (o *outbound) listenPort() int {
@@ -222,7 +231,11 @@ func (o *outbound) handle(conn net.Conn, h tunnel.StreamHeader) {
 		relay.Abort(conn)
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
+	if !rule.live.track(conn) {
+		return
+	}
+	defer rule.live.forget(conn)
+	ctx, cancel := context.WithTimeout(rule.live.ctx, connectTimeout)
 	defer cancel()
 
 	// 链式出口的中间跳:原样把流头转给下一跳。UDP 流的封装格式各跳相同,同样按字节转发即可。
@@ -238,8 +251,12 @@ func (o *outbound) handle(conn net.Conn, h tunnel.StreamHeader) {
 			return
 		}
 		cancel()
+		defer done()
+		if !rule.live.track(next) {
+			return
+		}
+		defer rule.live.forget(next)
 		relay.Pipe(conn, next, &relay.PipeOpts{Up: &o.sink, Down: &o.sink})
-		done()
 		return
 	}
 
@@ -255,8 +272,13 @@ func (o *outbound) handle(conn net.Conn, h tunnel.StreamHeader) {
 			return
 		}
 		cancel()
+		defer be.Active.Add(-1)
+		if !rule.live.track(target) {
+			return
+		}
+		defer rule.live.forget(target)
 		relay.Pipe(conn, target, &relay.PipeOpts{Up: &o.sink, Down: &o.sink, Prefix: prefix})
-		be.Active.Add(-1)
+
 	case tunnel.CmdUDP:
 		cands := rule.bal.Candidates(hash)
 		if len(cands) == 0 {
@@ -269,6 +291,10 @@ func (o *outbound) handle(conn net.Conn, h tunnel.StreamHeader) {
 			return
 		}
 		cancel()
+		if !rule.live.track(uc) {
+			return
+		}
+		defer rule.live.forget(uc)
 		relay.ServeUDPStream(conn, uc, 0)
 	}
 }
@@ -279,14 +305,22 @@ func (o *outbound) openUDP(client netip.AddrPort, ruleID uint32) (relay.Upstream
 	if rule == nil {
 		return nil, fmt.Errorf("规则 #%d 不存在", ruleID)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), connectTimeout)
+	ctx, cancel := context.WithTimeout(rule.live.ctx, connectTimeout)
 	defer cancel()
 	if rule.spec.Next != 0 { // 链式出口:后续各跳一律走隧道流
 		cli := o.tunnels.get(rule.spec.Next)
 		if cli == nil {
 			return nil, errors.New("下一跳不可用")
 		}
-		return cli.OpenUDP(ctx, ruleID, client, true)
+		stream, done, err := cli.Open(ctx, tunnel.StreamHeader{Cmd: tunnel.CmdUDP, RuleID: ruleID, Src: client})
+		if err != nil {
+			return nil, err
+		}
+		if !rule.live.track(stream) {
+			done()
+			return nil, net.ErrClosed
+		}
+		return &outUDP{Upstream: relay.NewStreamUpstream(stream), release: func() { rule.live.forget(stream); done() }}, nil
 	}
 	cands := rule.bal.Candidates(relay.HashAddr(client.Addr()))
 	if len(cands) == 0 {
@@ -296,7 +330,20 @@ func (o *outbound) openUDP(client netip.AddrPort, ruleID uint32) (relay.Upstream
 	if err != nil {
 		return nil, err
 	}
-	return relay.UDPConnUpstream{UDPConn: uc}, nil
+	if !rule.live.track(uc) {
+		return nil, net.ErrClosed
+	}
+	return &outUDP{Upstream: relay.UDPConnUpstream{UDPConn: uc}, release: func() { rule.live.forget(uc) }}, nil
+}
+
+type outUDP struct {
+	relay.Upstream
+	release func()
+}
+
+func (u *outUDP) Close() error {
+	defer u.release()
+	return u.Upstream.Close()
 }
 
 // reverseStatus 汇总反向隧道的连接情况:需要拨入的入口节点数,以及其中已连上的个数。

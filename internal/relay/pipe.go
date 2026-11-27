@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"context"
 	"io"
 	"net"
 	"sync/atomic"
@@ -19,6 +20,7 @@ const (
 // PipeOpts 是一次 TCP 双向转发的参数。
 // 约定:Up = 客户端 -> 目标,Down = 目标 -> 客户端。
 type PipeOpts struct {
+	Context              context.Context
 	Up, Down             *atomic.Int64 // 流量计数器(不可为 nil)
 	UpLimits, DownLimits [2]*Bucket    // 规则级、用户级限速桶,nil 表示不限
 	Prefix               []byte        // 已从客户端读出(嗅探)、需要先写给目标的数据
@@ -37,19 +39,23 @@ func Pipe(client, target net.Conn, o *PipeOpts) {
 	ActiveTCP.Add(1)
 	defer ActiveTCP.Add(-1)
 	p := &pipe{}
+	ctx := o.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	done := make(chan struct{})
 	go func() {
-		p.oneWay(target, client, o.Up, o.UpLimits, o.Prefix)
+		p.oneWay(target, client, o.Up, o.UpLimits, o.Prefix, ctx)
 		close(done)
 	}()
-	p.oneWay(client, target, o.Down, o.DownLimits, nil)
+	p.oneWay(client, target, o.Down, o.DownLimits, nil, ctx)
 	<-done
 	client.Close()
 	target.Close()
 }
 
-func (p *pipe) oneWay(dst, src net.Conn, ctr *atomic.Int64, lim [2]*Bucket, prefix []byte) {
-	if err := p.copy(dst, src, ctr, lim, prefix); err != nil {
+func (p *pipe) oneWay(dst, src net.Conn, ctr *atomic.Int64, lim [2]*Bucket, prefix []byte, ctx context.Context) {
+	if err := p.copy(dst, src, ctr, lim, prefix, ctx); err != nil {
 		Abort(src)
 		Abort(dst)
 		return
@@ -64,14 +70,16 @@ func (p *pipe) oneWay(dst, src net.Conn, ctr *atomic.Int64, lim [2]*Bucket, pref
 	}
 }
 
-func (p *pipe) copy(dst, src net.Conn, ctr *atomic.Int64, lim [2]*Bucket, prefix []byte) error {
+func (p *pipe) copy(dst, src net.Conn, ctr *atomic.Int64, lim [2]*Bucket, prefix []byte, ctx context.Context) error {
 	if len(prefix) > 0 {
-		lim[0].Wait(len(prefix))
-		lim[1].Wait(len(prefix))
-		if _, err := dst.Write(prefix); err != nil {
+		if err := waitPipeLimits(ctx, lim, len(prefix)); err != nil {
 			return err
 		}
-		ctr.Add(int64(len(prefix)))
+		written, err := dst.Write(prefix)
+		ctr.Add(int64(written))
+		if err != nil {
+			return err
+		}
 	}
 	if canSplice && lim[0] == nil && lim[1] == nil {
 		if d, ok := dst.(*net.TCPConn); ok {
@@ -95,12 +103,14 @@ func (p *pipe) copy(dst, src net.Conn, ctr *atomic.Int64, lim [2]*Bucket, prefix
 		}
 		n, rerr := src.Read(buf)
 		if n > 0 {
-			lim[0].Wait(n)
-			lim[1].Wait(n)
-			if _, werr := dst.Write(buf[:n]); werr != nil {
+			if err := waitPipeLimits(ctx, lim, n); err != nil {
+				return err
+			}
+			written, werr := dst.Write(buf[:n])
+			ctr.Add(int64(written))
+			if werr != nil {
 				return werr
 			}
-			ctr.Add(int64(n))
 		}
 		if rerr != nil {
 			if rerr == io.EOF {
@@ -109,6 +119,15 @@ func (p *pipe) copy(dst, src net.Conn, ctr *atomic.Int64, lim [2]*Bucket, prefix
 			return rerr
 		}
 	}
+}
+
+func waitPipeLimits(ctx context.Context, lim [2]*Bucket, n int) error {
+	for _, bucket := range lim {
+		if err := bucket.wait(ctx, n); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // spliceLoop 利用 io.CopyN -> (*TCPConn).ReadFrom -> splice(2) 实现内核态零拷贝,
@@ -142,6 +161,10 @@ func CloseWrite(c net.Conn) bool {
 
 // Abort 立即终止连接:多路复用流发送 RST,其余直接关闭。
 func Abort(c net.Conn) {
+	if tlsConn, ok := c.(interface{ NetConn() net.Conn }); ok {
+		Abort(tlsConn.NetConn())
+		return
+	}
 	if r, ok := c.(interface{ Reset() error }); ok {
 		r.Reset()
 		return
